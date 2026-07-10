@@ -23,6 +23,12 @@
 
 ---
 
+> **Unofficial fork.** Not affiliated with, endorsed by, or sponsored by Anthropic.
+> "Claude" and "Anthropic" are trademarks of Anthropic PBC.
+> See [DISCLAIMER.md](DISCLAIMER.md) and [NOTICE.md](NOTICE.md).
+
+---
+
 <p align="center">
   <a href="https://youtu.be/n4-2fjOsGhw">
     <img src="https://img.youtube.com/vi/n4-2fjOsGhw/maxresdefault.jpg" alt="Demo — Claude on Tinder, Reddit, and Robinhood" width="820"/>
