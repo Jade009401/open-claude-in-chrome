@@ -34,3 +34,18 @@ test('collapsed_group:处在编号 run 中也不被 promote 为 document_section
   assert.ok(cg, 'collapsed_group 应保留');
   assert.notStrictEqual(cg.type, 'document_section', '编号 run 中也不应被 promote(需 promote 排除)');
 });
+
+test('applyAnchorBudget:超预算时保锚点、砍纯文本、父链不断', () => {
+  const nodes = [];
+  nodes.push({ id: 'h1', type: 'document_section', parentId: null, title: '标题', level: 2, number: null });
+  nodes.push({ id: 'btn', type: 'control', parentId: 'h1', title: '下单', role: 'button' });
+  // 大量纯 dom_node 文本(chrome scope 优先被砍)
+  for (let i = 0; i < 50; i += 1) nodes.push({ id: `t${i}`, type: 'dom_node', parentId: null, text: `噪声${i}`, scopeHint: 'chrome' });
+  const kept = kernel.applyAnchorBudget(nodes, 5);
+  const ids = new Set(kept.map((n) => n.id));
+  assert.ok(ids.has('h1') && ids.has('btn'), '锚点必须保留');
+  assert.ok(kept.length <= 5 + 2, '预算软上限(+父链余量)');
+  // 父链不断:btn 的父 h1 在集合内
+  for (const n of kept) if (n.parentId) assert.ok(ids.has(n.parentId), `父 ${n.parentId} 应在集合内`);
+});
+

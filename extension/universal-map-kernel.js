@@ -5,6 +5,7 @@
   if (!core) throw new Error('ClaudeUniversalBrowserMapCore is required');
 
   const KERNEL_SCHEMA_VERSION = 1;
+  const OUTPUT_NODE_BUDGET = 5000;
   const COMPLETE_STATES = new Set(['complete', 'ready', 'stable_end', 'snapshot_complete', 'authoritative_complete']);
   const INCOMPLETE_STATES = new Set(['incomplete', 'failed', 'error', 'truncated']);
   const CHROME_ROLES = new Set(['toolbar', 'navigation', 'banner', 'complementary', 'menubar', 'menu', 'status', 'header', 'footer']);
@@ -323,6 +324,39 @@
     };
   }
 
+  function anchorRank(node) {
+    const type = core.normalizeText(node.type || '').toLowerCase();
+    const scope = core.normalizeText(node.scopeHint || node.attributes?.scopeHint || '').toLowerCase();
+    if (/document_section|heading|^document$/.test(type) || node.level) return 100;
+    if (type === 'control' || type === 'form') return 90;
+    if (type === 'collapsed_group') return 80;
+    if (Number.isFinite(Number(node.number)) && Number(node.number)) return 70;
+    if (core.normalizeText(node.title) || node.attributes?.['aria-label']) return 50;
+    if (scope === 'chrome' || scope === 'navigation') return 10; // 纯装饰/导航文本最先砍
+    return 30;
+  }
+
+  // 超预算时按锚点优先保留;并保留被留节点的祖先链(不产生孤儿)。软上限。
+  function applyAnchorBudget(nodes, budget = OUTPUT_NODE_BUDGET) {
+    if (!Array.isArray(nodes) || nodes.length <= budget) return nodes || [];
+    const byId = new Map(nodes.map((n) => [String(n.id), n]));
+    const ranked = nodes.map((n, i) => ({ n, i, r: anchorRank(n) })).sort((a, b) => (b.r - a.r) || (a.i - b.i));
+    const keep = new Set();
+    for (const { n } of ranked) {
+      if (keep.size >= budget) break;
+      keep.add(String(n.id));
+    }
+    for (const id of [...keep]) {
+      let cur = byId.get(id);
+      let guard = 0;
+      while (cur && cur.parentId && !keep.has(String(cur.parentId)) && guard++ < 64) {
+        keep.add(String(cur.parentId));
+        cur = byId.get(String(cur.parentId));
+      }
+    }
+    return nodes.filter((n) => keep.has(String(n.id)));
+  }
+
   function compileEvidenceBatches(inputBatches = [], meta = {}) {
     const batches = (inputBatches || [])
       .filter(Boolean)
@@ -380,11 +414,12 @@
       parentId: node.parentId ? rawIdToFinal.get(String(node.parentId)) || node.parentId : null,
       children: [],
     }));
+    const budgetedNodes = applyAnchorBudget(mergedNodes, OUTPUT_NODE_BUDGET);
 
-    const mapCoverage = coverageFromBatches(batches, mergedNodes.length);
+    const mapCoverage = coverageFromBatches(batches, budgetedNodes.length);
     const diagnostics = batches.flatMap((batch) => batch.diagnostics || []).slice(0, 80);
     const capabilities = [...new Set(batches.flatMap((batch) => batch.capabilities || []))];
-    const map = core.buildMap([{ adapter: 'universal_map_kernel', nodes: mergedNodes, diagnostics, capabilities }], {
+    const map = core.buildMap([{ adapter: 'universal_map_kernel', nodes: budgetedNodes, diagnostics, capabilities }], {
       ...meta,
       completeness: {
         complete: mapCoverage.status !== 'incomplete',
@@ -404,7 +439,7 @@
     for (let value = numberedFinal[0] || 0; numberedFinal.length && value <= numberedFinal.at(-1) && ordinalGaps.length < 64; value += 1) {
       if (!numberedFinal.includes(value)) ordinalGaps.push(value);
     }
-    map.kernelTrace = { batches: batchTraces, recordsTotal: records.length, mergedTotal: mergedNodes.length, numberedFinal: numberedFinal.slice(0, 512), ordinalGaps };
+    map.kernelTrace = { batches: batchTraces, recordsTotal: records.length, mergedTotal: budgetedNodes.length, budgetApplied: budgetedNodes.length < mergedNodes.length, numberedFinal: numberedFinal.slice(0, 512), ordinalGaps };
     return map;
   }
 
@@ -415,6 +450,7 @@
     evidenceBatchFromFragment,
     compileEvidenceBatches,
     coverageFromBatches,
+    applyAnchorBudget,
   };
 
   global.ClaudeUniversalMapKernel = api;
