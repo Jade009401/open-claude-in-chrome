@@ -1,3 +1,5 @@
+// 本仓库为本文件唯一事实源(已从 v0.15.3 分叉 + generic_dom 通用降噪改造)。
+// 勿用 install-macos.sh 或外部 vendor 覆盖。见 docs/superpowers/specs/2026-07-18-generic-dom-降噪-design.md
 (function (global) {
   'use strict';
 
