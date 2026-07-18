@@ -49,3 +49,25 @@ test('applyAnchorBudget:超预算时保锚点、砍纯文本、父链不断', ()
   for (const n of kept) if (n.parentId) assert.ok(ids.has(n.parentId), `父 ${n.parentId} 应在集合内`);
 });
 
+test('coverage:折叠(有 warnings 无 reasons)→ complete_with_warnings,不 incomplete', () => {
+  const nodes = [{ id: 'cg1', type: 'collapsed_group', parentId: null, title: '500× div.row', collapsed: { signature: 'DIV|row', totalCount: 500, hiddenCount: 497 }, attributes: { signature: 'DIV|row' } }];
+  const b = kernel.evidenceBatchFromFragment(
+    { adapter: 'generic_dom', nodes, capabilities: [], collection: { status: 'snapshot_complete', truncated: false, limitReached: false, nodeCount: 1, collapsedGroups: 1, hiddenNodes: 497, warnings: ['1 repeated regions collapsed (497 nodes hidden)'], reasons: [] } },
+    { collector: 'generic_dom', role: 'primary', required: true, authority: 'derived' },
+  );
+  const map = kernel.compileEvidenceBatches([b], { url: 'https://x.test' });
+  assert.notStrictEqual(map.mapCoverage.status, 'incomplete');
+  assert.ok(map.mapCoverage.warnings.some((w) => /collapsed/.test(w)), 'warning 应透出');
+});
+
+test('coverage:真截断(truncated+reasons)→ 仍 incomplete(诚实)', () => {
+  const nodes = [{ id: 'n1', type: 'dom_node', parentId: null, text: 'x' }];
+  const b = kernel.evidenceBatchFromFragment(
+    { adapter: 'generic_dom', nodes, capabilities: [], collection: { status: 'truncated', truncated: true, limitReached: true, nodeCount: 1, warnings: [], reasons: ['generic_dom_node_limit_reached'] } },
+    { collector: 'generic_dom', role: 'primary', required: true, authority: 'derived' },
+  );
+  const map = kernel.compileEvidenceBatches([b], { url: 'https://x.test' });
+  assert.strictEqual(map.mapCoverage.status, 'incomplete');
+});
+
+
