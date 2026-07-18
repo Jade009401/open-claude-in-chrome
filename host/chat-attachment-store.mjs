@@ -51,57 +51,11 @@ function findPromptTarget(message) {
   return null;
 }
 
-function extractPromptText(message) {
-  const found = findPromptTarget(message);
-  return found ? String(found.target[found.key] || '') : '';
-}
-
-export function determineAttachmentRouting(prompt) {
-  const text = String(prompt || '').normalize('NFKC').trim();
-  const explicitBrowser = /(?:浏览器(?:页面|网页)?|当前(?:打开的)?网页|当前浏览器|打开的网页|活动标签页|标签页|tab\b|browser\b|webpage\b|website\b)/i.test(text);
-  const explicitAttachment = /(?:附件|上传的?(?:图片|文件|截图|文档)|这张(?:图|图片|截图)|这个文件|这份(?:文件|文档)|PDF|图片|截图|文件)/i.test(text);
-  const explicitCombined = /(?:同时|一起|结合|对比|比较|分别|以及|并且|一并|both\b|compare\b|alongside\b)/i.test(text);
-
-  if (explicitBrowser) {
-    return {
-      mode: 'attachment_first_then_browser',
-      priority: 'attachment',
-      browserAllowed: true,
-      reason: explicitAttachment || explicitCombined
-        ? 'The user explicitly requested both attachment and browser context.'
-        : 'The user explicitly referenced the browser page; attachments must still be inspected first.',
-    };
-  }
-
-  return {
-    mode: 'attachment_only',
-    priority: 'attachment',
-    browserAllowed: false,
-    reason: 'Attachments are present and the request does not explicitly reference the browser. Ambiguous words such as 页面 refer to the attachment.',
-  };
-}
-
-function buildContext(files, prompt) {
+function buildContext(files) {
   const lines = files.map((file, index) =>
     `${index + 1}. ${file.name} (${file.mimeType}, ${file.size} bytes)\n   Local path: ${file.path}`
   );
-  const routing = determineAttachmentRouting(prompt);
-  const browserRule = routing.browserAllowed
-    ? 'After the relevant attachments have been successfully inspected, browser tools may be used only for the explicitly requested browser portion.'
-    : 'Do not call browser, page-context, Lark, screenshot, DOM, or web-app tools in this turn. The active browser page is not the target.';
-  return {
-    routing,
-    context: `<claude_sidebar_attachment_routing priority="hard" mode="${routing.mode}">\n` +
-      `This turn contains user attachments. Attachment analysis has priority over the active browser page.\n` +
-      `Mandatory first step: inspect every relevant attachment at the local paths below with the appropriate local file/image/PDF/document tool.\n` +
-      `When the user says ambiguous phrases such as “这个页面”, “这个”, “这张”, or “分析一下”, interpret them as referring to the attached file or image, not the currently open browser tab.\n` +
-      `${browserRule}\n` +
-      `Never claim the attachment was analyzed until a file-reading tool has successfully read it.\n` +
-      `</claude_sidebar_attachment_routing>\n\n` +
-      `<claude_sidebar_attachments>\nThe user attached the following local files to this turn:\n${lines.join('\n')}\n\n` +
-      `For images, inspect the actual image pixels; do not infer content from the filename. For PDFs, documents, spreadsheets, archives, or source files, use the appropriate reader/tool.\n` +
-      `</claude_sidebar_attachments>`
-  };
+  return `\n\n<claude_sidebar_attachments>\nThe user attached the following local files to this turn:\n${lines.join('\n')}\n\nTreat these files as part of the user's message. Before answering, inspect every relevant file with the available local file-reading tools. For images, inspect the actual image pixels; do not infer content from the filename. For PDFs, documents, spreadsheets, archives, or source files, use the appropriate reader/tool. Do not claim a file was read unless the tool call succeeded.\n</claude_sidebar_attachments>`;
 }
 
 export function cleanupOldAttachments({ now = Date.now(), retentionMs = RETENTION_MS } = {}) {
@@ -170,16 +124,11 @@ export function prepareChatMessageAttachments(message, options = {}) {
       });
     }
 
-    const originalPrompt = extractPromptText(message);
-    const { context, routing } = buildContext(files, originalPrompt);
+    const context = buildContext(files);
     const promptTarget = findPromptTarget(message);
-    if (promptTarget) {
-      promptTarget.target[promptTarget.key] = `${context}\n\n<user_request>\n${originalPrompt}\n</user_request>`;
-    } else {
-      message.prompt = `${context}\n\n<user_request>\n请读取并分析附件。\n</user_request>`;
-    }
+    if (promptTarget) promptTarget.target[promptTarget.key] = `${promptTarget.target[promptTarget.key]}${context}`;
+    else message.prompt = context.trimStart();
     message.attachmentRefs = files;
-    message.attachmentRouting = routing;
     delete message.attachments;
     cleanupOldAttachments();
     return { ok: true, files, message };

@@ -12,3 +12,13 @@ host/chat-native-host-wrapper.sh
 claude-sidebar-patch/
 # 编译产物(spawn-clean.c 可重建,不提交二进制)
 host/spawn-clean
+
+# AI dev tools (aid init 生成，勿提交)
+CLAUDE.md
+.claude/commands/pipeline
+.claude/commands/opsx
+.claude/skills
+.ai-index/
+openspec
+.github/prompts
+.github/skills
