@@ -11,7 +11,7 @@
   const CONTENT_TYPES = new Set([
     'document', 'document_section', 'document_block', 'table', 'table_row', 'table_cell',
     'sheet', 'sheet_cell', 'figma_canvas', 'figma_node', 'canvas_surface', 'canvas_node',
-    'application', 'region', 'form', 'control', 'dialog', 'data_field', 'image', 'attachment',
+    'application', 'region', 'form', 'control', 'dialog', 'data_field', 'image', 'attachment', 'collapsed_group',
   ]);
 
   const SOURCE_PRIORITY = Object.freeze({
@@ -142,7 +142,7 @@
     const label = evidenceLabel(node);
     const number = core.extractLeadingNumber(label);
     const type = core.normalizeText(node.type || node.kindHint || '').toLowerCase();
-    if (!runSet.has(Number(number)) || /document_section|table|cell|code|control|input/.test(type)) return node;
+    if (!runSet.has(Number(number)) || /document_section|table|cell|code|control|input|collapsed_group/.test(type)) return node;
     return {
       ...node,
       type: 'document_section',
@@ -167,6 +167,10 @@
     const type = core.normalizeText(node.type || node.kindHint || 'node').toLowerCase();
     const frameId = Number(node.frameId ?? batch.frameId ?? 0);
     if (type === 'document') return `document:${frameId}`;
+    if (type === 'collapsed_group') {
+      const sig = core.normalizeText(node.collapsed?.signature || node.attributes?.signature || '');
+      return `collapse:${frameId}:${sig}:${node.parentId || ''}`;
+    }
     if (number !== null && /section|heading|listitem/.test(`${type} ${node.role || ''}`)) {
       return `numbered:${frameId}:${number}:${label.slice(0, 160)}`;
     }
