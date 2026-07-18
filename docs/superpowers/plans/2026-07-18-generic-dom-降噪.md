@@ -421,21 +421,37 @@ function batch(nodes, extra = {}) {
   );
 }
 
-test('collapsed_group 在 compile 后保留,且不被升级为 document_section', () => {
+test('collapsed_group:scope=content(CONTENT_TYPES)、同签名不同父不合并(evidenceKey)', () => {
   const nodes = [
-    { id: 'cg1', type: 'collapsed_group', parentId: null, title: '500× div.row', collapsed: { signature: 'DIV|row', totalCount: 500, hiddenCount: 497 }, attributes: { signature: 'DIV|row' }, confidence: 0.7 },
+    { id: 'cg1', type: 'collapsed_group', parentId: 'pA', title: '500× div.row', collapsed: { signature: 'DIV|row', totalCount: 500, hiddenCount: 497 }, attributes: { signature: 'DIV|row' }, confidence: 0.7 },
+    { id: 'cg2', type: 'collapsed_group', parentId: 'pB', title: '500× div.row', collapsed: { signature: 'DIV|row', totalCount: 500, hiddenCount: 497 }, attributes: { signature: 'DIV|row' }, confidence: 0.7 },
   ];
   const map = kernel.compileEvidenceBatches([batch(nodes)], { url: 'https://x.test' });
-  const cg = map.nodes.find((n) => n.type === 'collapsed_group');
+  const cgs = map.nodes.filter((n) => n.type === 'collapsed_group');
+  assert.strictEqual(cgs.length, 2, '同签名但不同 parentId 的折叠组不应被合并(需 evidenceKey 用 parentId 区分)');
+  assert.ok(cgs.every((n) => n.scopeHint === 'content'), 'collapsed_group 应归为 content(需 CONTENT_TYPES)');
+});
+
+test('collapsed_group:处在编号 run 中也不被 promote 为 document_section(promote 排除)', () => {
+  // 4/5/6 连续编号 → numberedRunSet 命中 5;若不排除,label 带 5 的折叠组会被升级。
+  const nodes = [
+    { id: 'a', type: 'dom_node', parentId: null, title: '4 项' },
+    { id: 'cg', type: 'collapsed_group', parentId: 'p', title: '5 组', collapsed: { signature: 'S', totalCount: 20, hiddenCount: 17 }, attributes: { signature: 'S' } },
+    { id: 'c', type: 'dom_node', parentId: null, title: '6 项' },
+  ];
+  const map = kernel.compileEvidenceBatches([batch(nodes)], { url: 'https://x.test' });
+  const cg = map.nodes.find((n) => n.collapsed); // 用 collapsed 字段找,类型即便被误改也能定位
   assert.ok(cg, 'collapsed_group 应保留');
-  assert.notStrictEqual(cg.type, 'document_section', '不应被 promote');
+  assert.notStrictEqual(cg.type, 'document_section', '编号 run 中也不应被 promote(需 promote 排除)');
 });
 ```
+
+> 三条断言分别对应 Step 3 的三处编辑:`scope=content` ← CONTENT_TYPES;`length===2` ← evidenceKey 分支;`编号 run 不 promote` ← promote 正则排除。均为真 red→green。
 
 - [ ] **Step 2: 跑,确认失败**
 
 Run: `node --test test/kernel-budget.test.js`
-Expected: FAIL(collapsed_group 被 `shouldIncludeSupportingNode`/promote 影响,或断言不满足)
+Expected: FAIL —— 未加 CONTENT_TYPES 时 `scopeHint` 为 `unknown` 非 `content`;未加 evidenceKey 分支时同签名折叠组被 `semantic:` key 合并成 1 个;未加 promote 排除时编号 run 中的折叠组被升级为 `document_section`
 
 - [ ] **Step 3: 实现三处改动**
 
@@ -544,11 +560,13 @@ Expected: FAIL(`kernel.applyAnchorBudget` 不是函数)
   }
 ```
 
-在 `compileEvidenceBatches` 里,`const mergedNodes = mergedGroups.map(...)`(:374–378)之后加一行,并让后续 `buildMap` 用预算后的集合:
+在 `compileEvidenceBatches` 里,`const mergedNodes = mergedGroups.map(...)`(:374–378)之后加一行,并让后续 `buildMap`/coverage 用预算后的集合:
 ```js
     const budgetedNodes = applyAnchorBudget(mergedNodes, OUTPUT_NODE_BUDGET);
 ```
-把随后 `core.buildMap([{ adapter: 'universal_map_kernel', nodes: mergedNodes, ...`  中的 `nodes: mergedNodes` 改为 `nodes: budgetedNodes`;把末尾 `map.kernelTrace` 里 `mergedTotal: mergedNodes.length` 改为 `mergedTotal: budgetedNodes.length`,并新增 `budgetApplied: budgetedNodes.length < mergedNodes.length`。
+- 把随后(:380)`coverageFromBatches(batches, mergedNodes.length)` 的第二参改为 `budgetedNodes.length`(coverage 报预算后节点数,更准);
+- 把 `core.buildMap([{ adapter: 'universal_map_kernel', nodes: mergedNodes, ...`(:383)中的 `nodes: mergedNodes` 改为 `nodes: budgetedNodes`;
+- 把末尾 `map.kernelTrace`(:403)里 `mergedTotal: mergedNodes.length` 改为 `mergedTotal: budgetedNodes.length`,并新增 `budgetApplied: budgetedNodes.length < mergedNodes.length`。
 
 在 `const api = { ... }` 导出对象里加 `applyAnchorBudget`:
 ```js
