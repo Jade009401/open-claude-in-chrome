@@ -125,6 +125,20 @@ Find the absolute path with:
 echo "node $(pwd)/host/mcp-server.js"
 ```
 
+## Claude 侧栏聊天 daemon（Sidebar）
+
+`./install.sh <扩展id>` 除了浏览器自动化,也会一并装好**侧栏聊天 daemon**:
+
+- 常驻的 Claude Code daemon 由 launchd 管理(`com.openclaude.sidebar-daemon`),开机自启、崩溃自愈。
+- **run-from-clone**:daemon 直接运行本仓库 `host/` 里的代码,没有额外副本,仓库即唯一真相源。
+- Chrome 侧栏经 native messaging → 瘦 relay → daemon 的 unix socket 通信(daemon 脱离 Chrome 进程树,不再触发 macOS Gatekeeper 隔离)。
+
+改了 `host/` 里的 daemon 代码后,重启 daemon 生效:
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.openclaude.sidebar-daemon"
+```
+
 ## Verification
 
 Start a new Claude Code session and test:

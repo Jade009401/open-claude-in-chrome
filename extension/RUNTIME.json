@@ -1,0 +1,8 @@
+{
+  "product": "Claude Sidebar",
+  "version": "0.15.3",
+  "protocolVersion": 13,
+  "mode": "pure-map-runtime-v1-overlay",
+  "browserSessionProtocol": "pure-map-runtime-v1",
+  "mapKernel": "universal-map-kernel-v1"
+}

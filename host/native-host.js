@@ -60,6 +60,7 @@ let tcpSocket = null;
 let tcpBuffer = Buffer.alloc(0);
 let reconnectTimer = null;
 let reconnectAttempts = 0;
+let lastBrowserContext = null; // replay current adopted page after MCP TCP reconnect
 const MAX_RECONNECT_ATTEMPTS = 60; // 30 seconds at 500ms intervals
 const TCP_PORT = getPort();
 
@@ -70,6 +71,9 @@ function connectTcp() {
 
   tcpSocket.connect(TCP_PORT, "127.0.0.1", () => {
     reconnectAttempts = 0;
+    if (lastBrowserContext) {
+      tcpSocket.write(JSON.stringify(lastBrowserContext) + "\n");
+    }
     if (reconnectTimer) {
       clearInterval(reconnectTimer);
       reconnectTimer = null;
@@ -124,7 +128,11 @@ process.stdin.on("data", (chunk) => {
   stdinBuffer = remainder;
 
   for (const msg of messages) {
-    // Forward to MCP server via TCP
+    if (msg?.type === "browser_context") {
+      lastBrowserContext = msg;
+    }
+    // Forward to MCP server via TCP. browser_context is retained and replayed
+    // when the TCP socket is not ready yet or reconnects later.
     if (tcpSocket && !tcpSocket.destroyed) {
       tcpSocket.write(JSON.stringify(msg) + "\n");
     }

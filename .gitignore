@@ -3,3 +3,12 @@ host/native-host-wrapper.sh
 .env
 *.log
 .DS_Store
+
+# 机器专属 / 生成物(由 install.sh 现场生成,不入仓库)
+host/sidebar-mcp.json
+host/chat-native-host-wrapper.sh
+# 本地开发索引与过渡补丁工具(不随仓库分发)
+.ai-index/
+claude-sidebar-patch/
+# 编译产物(spawn-clean.c 可重建,不提交二进制)
+host/spawn-clean

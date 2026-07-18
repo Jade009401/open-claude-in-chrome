@@ -16,6 +16,10 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { z } from "zod";
+import { PageContextManager } from "./page-context/page-context-manager.mjs";
+import { LarkIndexManager } from "./lark-index/lark-index-manager.mjs";
+import { CapabilityRegistry } from "./capability-registry.js";
+import { registerLarkAdapter } from "./lark-adapter.js";
 
 
 const DEFAULT_PORT = 18765;
@@ -31,6 +35,78 @@ function getPort() {
 }
 
 const TCP_PORT = getPort();
+
+const BROWSER_IMAGE_MODE = process.env.CLAUDE_SIDEBAR_IMAGE_MODE || "mcp-image";
+
+function textContentOf(result) {
+  if (!result?.content || !Array.isArray(result.content)) return "";
+  return result.content
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n");
+}
+
+function hasImageContent(result) {
+  return Boolean(result?.content?.some((part) => part?.type === "image"));
+}
+
+async function transformBrowserImageResult(toolName, args, result) {
+  if (BROWSER_IMAGE_MODE === "mcp-image" || !hasImageContent(result)) {
+    return result;
+  }
+
+  const originalText = textContentOf(result);
+  let pageSnapshot = "";
+  let layoutSnapshot = "";
+  if (toolName === "computer" && Number.isFinite(Number(args?.tabId))) {
+    const tabId = Number(args.tabId);
+    try {
+      const fallback = await sendToExtension("read_page", {
+        tabId,
+        depth: 6,
+        max_chars: 24000,
+      });
+      pageSnapshot = textContentOf(fallback);
+    } catch (error) {
+      pageSnapshot = "Accessibility fallback failed: " + (error?.message || String(error));
+    }
+
+    try {
+      const geometry = await sendToExtension("inspect_layout", {
+        tabId,
+        focus: "auto",
+        detail: "summary",
+        maxItems: 6,
+        comparePrevious: true,
+      });
+      layoutSnapshot = textContentOf(geometry);
+    } catch (error) {
+      layoutSnapshot = "Layout geometry fallback failed: " + (error?.message || String(error));
+    }
+  }
+
+  const modeNotice =
+    "[Claude Sidebar safe screenshot mode]\n" +
+    "Chrome completed the browser capture, but the MCP image content block was intentionally withheld from Claude Code on macOS to avoid the known Gatekeeper/native .node extraction failure. " +
+    "The result below already includes accessibility and read-only DOM geometry. Do not retry screenshot in a loop and do not ask the user whether to measure DOM geometry. " +
+    "For clipping, modal height, footer/button reachability, fixed/sticky occlusion, scroll traps, responsive overflow, and before/after verification, use the structured diagnosis directly or call inspect_layout automatically. Start with detail=summary; use detail=full or targetText only when more detail is needed.";
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: [
+          originalText,
+          modeNotice,
+          pageSnapshot && ("Accessibility snapshot after browser action:\n" + pageSnapshot),
+          layoutSnapshot && ("Layout geometry after browser action:\n" + layoutSnapshot),
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
+      },
+    ],
+  };
+}
 
 // --- Mode detection ---
 // Try to bind the port. If it's taken, switch to client mode.
@@ -51,37 +127,273 @@ const clientRequestMap = new Map();
 let primarySocket = null;
 let clientBuffer = Buffer.alloc(0);
 
+let currentBrowserContext = null;
+let capabilityRegistry = null;
+const BROWSER_CONTEXT_FILE = process.env.CLAUDE_SIDEBAR_CONTEXT_FILE || (process.platform === "darwin"
+  ? path.join(os.homedir(), "Library", "Application Support", "ClaudeSidebarHost", "browser-context.json")
+  : path.join(os.homedir(), ".config", "claude-sidebar", "browser-context.json"));
+
+function readPersistedBrowserContext() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(BROWSER_CONTEXT_FILE, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function getEffectiveBrowserContext() {
+  return readPersistedBrowserContext() || currentBrowserContext;
+}
+
+function applyBrowserContext(context) {
+  currentBrowserContext = context || null;
+  const changed = capabilityRegistry?.updateContext(currentBrowserContext) || [];
+  if (changed.length > 0) {
+    process.stderr.write(
+      `Capability adapters changed: ${changed.map((item) => `${item.id}=${item.active ? "on" : "off"}`).join(", ")}\n`,
+    );
+  }
+}
+
+function broadcastBrowserContext(message) {
+  const line = JSON.stringify(message) + "\n";
+  for (const socket of clientSockets.values()) {
+    if (!socket.destroyed) socket.write(line);
+  }
+}
+
+// CLAUDE_SIDEBAR_V67_CONNECTION_RECOVERY
+const CONNECTION_RECOVERY_WAIT_MS = 30000;
+const CONNECTION_RECOVERY_POLL_MS = 100;
+const RECOVERY_SAFE_TO_RETRY_TOOLS = new Set([
+  "lark_document_identity",
+  "lark_deep_read",
+  "lark_locate",
+  "lark_session_start",
+  "lark_index_refresh",
+  "lark_index_status",
+  "lark_query",
+  "lark_index_cleanup",
+  "tabs_context_mcp",
+  "browser_app_inspect",
+  "browser_app_query",
+]);
+let connectionRecoveryState = "starting";
+let connectionLastError = null;
+let connectionStateChangedAt = Date.now();
+let primaryReconnectTimer = null;
+let primaryElectionTimer = null;
+let primaryConnectInFlight = false;
+let primaryRecoveryAttempt = 0;
+let primaryConnectedAt = null;
+let nativeHostConnectedAt = null;
+
+function socketReady(socket) {
+  return Boolean(socket && !socket.destroyed && socket.writable);
+}
+
+function setConnectionRecoveryState(state, error = null) {
+  connectionRecoveryState = state;
+  connectionLastError = error ? String(error) : null;
+  connectionStateChangedAt = Date.now();
+}
+
+function getSidebarConnectionStatus() {
+  return {
+    ok: true,
+    mode,
+    recoveryState: connectionRecoveryState,
+    primaryConnected: mode === "primary" ? Boolean(tcpServer?.listening) : socketReady(primarySocket),
+    nativeHostConnected: mode === "primary" ? socketReady(nativeHostSocket) : null,
+    primaryConnectedAt,
+    nativeHostConnectedAt,
+    lastError: connectionLastError,
+    stateChangedAt: new Date(connectionStateChangedAt).toISOString(),
+    pendingRequestCount: pendingRequests.size,
+    connectedClientCount: clientSockets.size,
+    recoveryAttempt: primaryRecoveryAttempt,
+  };
+}
+
+function currentOutboundSocket() {
+  return mode === "primary" ? nativeHostSocket : primarySocket;
+}
+
+function transportReady() {
+  return socketReady(currentOutboundSocket());
+}
+
+function safeToRetryTool(tool) {
+  return RECOVERY_SAFE_TO_RETRY_TOOLS.has(String(tool || ""));
+}
+
+function rejectPendingEntry(id, entry, error) {
+  clearTimeout(entry.timer);
+  pendingRequests.delete(id);
+  try { entry.reject(error); } catch {}
+}
+
+function markPendingForRecovery(reason) {
+  for (const [id, entry] of pendingRequests) {
+    if (entry.inFlight && !safeToRetryTool(entry.tool)) {
+      rejectPendingEntry(id, entry, new Error("Connection changed after dispatch; automatic retry is disabled for this tool."));
+      continue;
+    }
+    entry.inFlight = false;
+    entry.recoveryReason = reason || "transport_disconnected";
+  }
+}
+
+function markForwardedClientRequestsForRecovery(reason) {
+  for (const [prefixedId, info] of clientRequestMap) {
+    if (!info.sent) continue;
+    if (!safeToRetryTool(info.tool)) {
+      const clientSocket = clientSockets.get(info.clientId);
+      if (socketReady(clientSocket)) {
+        clientSocket.write(JSON.stringify({
+          id: info.originalId,
+          type: "tool_error",
+          error: "Connection changed after dispatch; automatic retry is disabled for this tool.",
+          code: "unsafe_retry_blocked",
+        }) + "\n");
+      }
+      clientRequestMap.delete(prefixedId);
+      continue;
+    }
+    info.sent = false;
+    info.recoveryReason = reason || "native_host_disconnected";
+  }
+}
+
+function dispatchPendingEntry(id) {
+  const entry = pendingRequests.get(id);
+  const socket = currentOutboundSocket();
+  if (!entry || entry.inFlight || !socketReady(socket)) return false;
+  entry.inFlight = true;
+  entry.dispatchCount = Number(entry.dispatchCount || 0) + 1;
+  socket.write(JSON.stringify({ id, type: "tool_request", tool: entry.tool, args: entry.args }) + "\n");
+  return true;
+}
+
+function cancelForwardedClientRequestsForClient(clientId, reason = "client_disconnected") {
+  for (const [prefixedId, info] of clientRequestMap) {
+    if (String(info.clientId) !== String(clientId)) continue;
+    if (mode === "primary" && socketReady(nativeHostSocket)) {
+      try {
+        nativeHostSocket.write(JSON.stringify({ id: prefixedId, type: "tool_cancel", reason }) + "\n");
+      } catch {}
+    }
+    clientRequestMap.delete(prefixedId);
+  }
+}
+
+function dispatchForwardedClientRequests() {
+  if (mode !== "primary" || !socketReady(nativeHostSocket)) return;
+  for (const [prefixedId, info] of clientRequestMap) {
+    if (info.sent) continue;
+    const clientSocket = clientSockets.get(info.clientId);
+    if (!socketReady(clientSocket)) {
+      clientRequestMap.delete(prefixedId);
+      continue;
+    }
+    info.sent = true;
+    nativeHostSocket.write(JSON.stringify({
+      id: prefixedId,
+      type: "tool_request",
+      tool: info.tool,
+      args: info.args,
+    }) + "\n");
+  }
+}
+
+function dispatchAllPendingRequests() {
+  if (!transportReady()) return;
+  for (const id of pendingRequests.keys()) dispatchPendingEntry(id);
+  dispatchForwardedClientRequests();
+}
+
+async function waitForExtensionTransport(timeoutMs = CONNECTION_RECOVERY_WAIT_MS) {
+  const startedAt = Date.now();
+  while (!transportReady()) {
+    if (Date.now() - startedAt >= timeoutMs) {
+      const status = getSidebarConnectionStatus();
+      throw new Error("Browser transport did not recover within " + timeoutMs + "ms: " + JSON.stringify(status));
+    }
+    await new Promise((resolve) => setTimeout(resolve, CONNECTION_RECOVERY_POLL_MS));
+  }
+  return currentOutboundSocket();
+}
+
+async function forwardClientRequestWhenReady(socket, msg, prefixedId) {
+  try {
+    if (mode !== "primary" || !socketReady(nativeHostSocket)) {
+      await waitForExtensionTransport(CONNECTION_RECOVERY_WAIT_MS);
+    }
+    const info = clientRequestMap.get(prefixedId);
+    if (!info || !socketReady(socket) || !socketReady(nativeHostSocket)) return;
+    if (!info.sent) {
+      info.sent = true;
+      nativeHostSocket.write(JSON.stringify({ ...msg, id: prefixedId }) + "\n");
+    }
+  } catch (error) {
+    clientRequestMap.delete(prefixedId);
+    if (socketReady(socket)) {
+      socket.write(JSON.stringify({
+        id: msg.id,
+        type: "tool_error",
+        error: String(error),
+        code: "connection_recovery_timeout",
+        retryable: true,
+      }) + "\n");
+    }
+  }
+}
+
+
 // --- sendToExtension: works in both modes ---
 
-function sendToExtension(tool, args) {
+async function waitForNativeHost(timeoutMs = 8000) {
+  const startedAt = Date.now();
+  while (!nativeHostSocket || nativeHostSocket.destroyed) {
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error("Browser extension is not connected after waiting for the native host.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function sendToExtension(tool, args) {
   return new Promise((resolve, reject) => {
     const id = String(++requestIdCounter);
+    // CLAUDE_SIDEBAR_V66_DEEP_READER_TIMEOUT
+    const requestTimeoutMs = ["lark_session_start", "lark_index_refresh"].includes(tool) ? 300000 : (["lark_deep_read", "lark_locate", "lark_query", "browser_app_query"].includes(tool) ? 180000 : 60000);
     const timer = setTimeout(() => {
       pendingRequests.delete(id);
-      reject(new Error("Tool request timed out after 60s"));
-    }, 60000);
-    pendingRequests.set(id, { resolve, reject, timer, tool, args, resent: false });
+      reject(new Error("Tool request timed out after " + requestTimeoutMs + "ms"));
+    }, requestTimeoutMs);
+    pendingRequests.set(id, {
+      resolve,
+      reject,
+      timer,
+      tool,
+      args,
+      resent: false,
+      inFlight: false,
+      dispatchCount: 0,
+    });
 
-    if (mode === "primary") {
-      if (!nativeHostSocket || nativeHostSocket.destroyed) {
-        clearTimeout(timer);
-        pendingRequests.delete(id);
-        reject(new Error("Browser extension is not connected. Make sure a supported Chromium browser is running with the Open Claude in Chrome extension installed and enabled."));
-        return;
+    (async () => {
+      try {
+        await waitForExtensionTransport(Math.min(CONNECTION_RECOVERY_WAIT_MS, Math.max(1000, requestTimeoutMs - 1000)));
+        if (!dispatchPendingEntry(id)) {
+          throw new Error("Transport recovered but the request could not be dispatched.");
+        }
+      } catch (error) {
+        const entry = pendingRequests.get(id);
+        if (entry) rejectPendingEntry(id, entry, error instanceof Error ? error : new Error(String(error)));
       }
-      const msg = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
-      nativeHostSocket.write(msg);
-    } else {
-      // Client mode: send to primary server
-      if (!primarySocket || primarySocket.destroyed) {
-        clearTimeout(timer);
-        pendingRequests.delete(id);
-        reject(new Error("Lost connection to primary MCP server."));
-        return;
-      }
-      const msg = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
-      primarySocket.write(msg);
-    }
+    })();
   });
 }
 
@@ -155,6 +467,11 @@ function processLine(line) {
   try {
     const msg = JSON.parse(line);
     if (msg.type === "heartbeat") return;
+    if (msg.type === "browser_context") {
+      applyBrowserContext(msg.context);
+      broadcastBrowserContext(msg);
+      return;
+    }
     handleResponse(msg);
   } catch {}
 }
@@ -208,6 +525,10 @@ function setupNativeHostConnection(socket, initialBuffer) {
   }
 
   nativeHostSocket = socket;
+  // CLAUDE_SIDEBAR_NATIVE_CONNECTED
+  nativeHostConnectedAt = new Date().toISOString();
+  setConnectionRecoveryState("connected");
+  dispatchAllPendingRequests();
   let buffer = initialBuffer;
 
   // Process any data already in the buffer
@@ -226,29 +547,20 @@ function setupNativeHostConnection(socket, initialBuffer) {
     }
   });
 
-  socket.on("error", () => { nativeHostSocket = null; });
+  // CLAUDE_SIDEBAR_NATIVE_RECOVERY_HANDLERS
+  dispatchAllPendingRequests();
+
+  socket.on("error", (error) => {
+    if (nativeHostSocket === socket) nativeHostSocket = null;
+    setConnectionRecoveryState("waiting_for_native_host", error?.message || "native_host_error");
+  });
 
   socket.on("close", () => {
     if (nativeHostSocket === socket) nativeHostSocket = null;
-    if (pendingRequests.size > 0) {
-      setTimeout(() => {
-        if (nativeHostSocket && !nativeHostSocket.destroyed) {
-          for (const [id, entry] of pendingRequests) {
-            if (entry.resent) continue;
-            entry.resent = true;
-            nativeHostSocket.write(JSON.stringify({ id, type: "tool_request", tool: entry.tool, args: entry.args }) + "\n");
-          }
-        } else {
-          for (const [, { reject, timer }] of pendingRequests) {
-            clearTimeout(timer);
-            reject(new Error("Native host disconnected"));
-          }
-          pendingRequests.clear();
-        }
-      }, 5000);
-    }
-  });
-}
+    markPendingForRecovery("native_host_disconnected");
+    markForwardedClientRequestsForRecovery("native_host_disconnected");
+    setConnectionRecoveryState("waiting_for_native_host", "native_host_disconnected");
+  });}
 
 function setupClientConnection(socket, initialBuffer) {
   const clientId = String(++clientIdCounter);
@@ -257,6 +569,9 @@ function setupClientConnection(socket, initialBuffer) {
 
   // Send ack
   socket.write(JSON.stringify({ type: "client_ack", clientId }) + "\n");
+  if (currentBrowserContext) {
+    socket.write(JSON.stringify({ type: "browser_context", context: currentBrowserContext }) + "\n");
+  }
 
   let buffer = initialBuffer;
 
@@ -271,15 +586,9 @@ function setupClientConnection(socket, initialBuffer) {
         if (msg.type === "tool_request" && msg.id) {
           // Forward to native host with a prefixed ID
           const prefixedId = `c${clientId}_${msg.id}`;
-          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id });
+          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id, tool: msg.tool, args: msg.args, sent: false });
 
-          if (!nativeHostSocket || nativeHostSocket.destroyed) {
-            // Send error back to client
-            socket.write(JSON.stringify({ id: msg.id, type: "tool_error", error: "Browser extension is not connected." }) + "\n");
-            clientRequestMap.delete(prefixedId);
-          } else {
-            nativeHostSocket.write(JSON.stringify({ ...msg, id: prefixedId }) + "\n");
-          }
+          forwardClientRequestWhenReady(socket, msg, prefixedId);
         }
       } catch {}
     }
@@ -295,75 +604,162 @@ function setupClientConnection(socket, initialBuffer) {
 
   socket.on("error", () => {});
   socket.on("close", () => {
+    cancelForwardedClientRequestsForClient(clientId, "mcp_client_closed");
     clientSockets.delete(clientId);
-    // Clean up any pending client requests
-    for (const [prefixedId, info] of clientRequestMap) {
-      if (info.clientId === clientId) clientRequestMap.delete(prefixedId);
-    }
-    process.stderr.write(`Client MCP server disconnected (client ${clientId})\n`);
   });
 }
 
 // --- Client mode: connect to primary ---
 
-function startClientMode() {
+// CLAUDE_SIDEBAR_V67_CLIENT_FAILOVER
+function clearClientRecoveryTimers() {
+  if (primaryReconnectTimer) clearTimeout(primaryReconnectTimer);
+  if (primaryElectionTimer) clearTimeout(primaryElectionTimer);
+  primaryReconnectTimer = null;
+  primaryElectionTimer = null;
+}
+
+function attachPrimaryClientSocket(socket) {
+  primarySocket = socket;
+  clientBuffer = Buffer.alloc(0);
   mode = "client";
-  process.stderr.write(`Port ${TCP_PORT} in use. Connecting as client to primary MCP server...\n`);
+  primaryConnectInFlight = false;
+  primaryRecoveryAttempt = 0;
+  primaryConnectedAt = new Date().toISOString();
+  setConnectionRecoveryState("connected");
+  process.stderr.write("Connected to primary MCP server on :" + TCP_PORT + "\n");
+  socket.write(JSON.stringify({ type: "client_hello" }) + "\n");
 
-  function connect() {
-    primarySocket = net.createConnection(TCP_PORT, "127.0.0.1", () => {
-      process.stderr.write(`Connected to primary MCP server on :${TCP_PORT}\n`);
-      // Send handshake
-      primarySocket.write(JSON.stringify({ type: "client_hello" }) + "\n");
-    });
+  socket.on("data", (chunk) => {
+    clientBuffer = Buffer.concat([clientBuffer, chunk]);
+    let idx;
+    while ((idx = clientBuffer.indexOf(10)) !== -1) {
+      const line = clientBuffer.subarray(0, idx).toString("utf-8").trim();
+      clientBuffer = clientBuffer.subarray(idx + 1);
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (msg.type === "client_ack") continue;
+        if (msg.type === "error") {
+          process.stderr.write("Primary server error: " + msg.error + "\n");
+          continue;
+        }
+        if (msg.id && pendingRequests.has(msg.id)) {
+          const { resolve, reject, timer } = pendingRequests.get(msg.id);
+          clearTimeout(timer);
+          pendingRequests.delete(msg.id);
+          if (msg.type === "tool_error") reject(new Error(msg.error || "Tool execution failed"));
+          else resolve(msg.result);
+        }
+      } catch {}
+    }
+  });
 
-    primarySocket.on("data", (chunk) => {
-      clientBuffer = Buffer.concat([clientBuffer, chunk]);
-      let idx;
-      while ((idx = clientBuffer.indexOf(10)) !== -1) {
-        const line = clientBuffer.subarray(0, idx).toString("utf-8").trim();
-        clientBuffer = clientBuffer.subarray(idx + 1);
-        if (!line) continue;
-        try {
-          const msg = JSON.parse(line);
-          if (msg.type === "client_ack") continue;
-          if (msg.type === "error") {
-            process.stderr.write(`Primary server error: ${msg.error}\n`);
-            continue;
-          }
-          // Tool response routed back from primary
-          if (msg.id && pendingRequests.has(msg.id)) {
-            const { resolve, reject, timer } = pendingRequests.get(msg.id);
-            clearTimeout(timer);
-            pendingRequests.delete(msg.id);
-            if (msg.type === "tool_error") {
-              reject(new Error(msg.error || "Tool execution failed"));
-            } else {
-              resolve(msg.result);
-            }
-          }
-        } catch {}
-      }
-    });
+  socket.on("error", (error) => {
+    connectionLastError = error?.message || String(error);
+  });
 
-    primarySocket.on("error", (err) => {
-      process.stderr.write(`Client connection error: ${err.message}\n`);
-    });
+  socket.on("close", () => {
+    if (primarySocket === socket) primarySocket = null;
+    markPendingForRecovery("primary_disconnected");
+    setConnectionRecoveryState("recovering_primary", "primary_disconnected");
+    scheduleClientRecovery("primary_disconnected");
+  });
 
-    primarySocket.on("close", () => {
-      primarySocket = null;
-      // Primary died, reject pending requests
-      for (const [, { reject, timer }] of pendingRequests) {
-        clearTimeout(timer);
-        reject(new Error("Primary MCP server disconnected"));
-      }
-      pendingRequests.clear();
-      // Try to reconnect after a delay (primary might restart)
-      setTimeout(connect, 2000);
-    });
+  dispatchAllPendingRequests();
+}
+
+function scheduleClientRecovery(reason, delayOverride) {
+  if (mode === "primary" || socketReady(primarySocket) || primaryReconnectTimer || primaryElectionTimer) return;
+  primaryRecoveryAttempt += 1;
+  setConnectionRecoveryState("recovering_primary", reason || "primary_unavailable");
+  const delay = Number.isFinite(delayOverride)
+    ? Math.max(0, delayOverride)
+    : 200 + Math.floor(Math.random() * 600);
+  primaryReconnectTimer = setTimeout(() => {
+    primaryReconnectTimer = null;
+    connectToPrimaryOrPromote();
+  }, delay);
+}
+
+function connectToPrimaryOrPromote() {
+  if (mode === "primary" || socketReady(primarySocket) || primaryConnectInFlight) return;
+  primaryConnectInFlight = true;
+  setConnectionRecoveryState("connecting_to_primary");
+  const socket = net.createConnection(TCP_PORT, "127.0.0.1");
+  let settled = false;
+  const connectTimer = setTimeout(() => {
+    failInitialConnect(new Error("primary_connect_timeout"));
+  }, 1000);
+
+  const onConnect = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(connectTimer);
+    socket.removeListener("error", failInitialConnect);
+    attachPrimaryClientSocket(socket);
+  };
+  function failInitialConnect(error) {
+    if (settled) return;
+    settled = true;
+    clearTimeout(connectTimer);
+    primaryConnectInFlight = false;
+    socket.removeListener("connect", onConnect);
+    socket.removeListener("error", failInitialConnect);
+    try { socket.destroy(); } catch {}
+    connectionLastError = error?.message || String(error);
+    attemptPrimaryPromotion();
+  }
+  socket.once("connect", onConnect);
+  socket.once("error", failInitialConnect);
+}
+
+function attemptPrimaryPromotion() {
+  if (mode === "primary" || socketReady(primarySocket)) return;
+  if (tcpServer.listening) {
+    mode = "primary";
+    primaryConnectInFlight = false;
+    writePidfile();
+    setConnectionRecoveryState(socketReady(nativeHostSocket) ? "connected" : "waiting_for_native_host");
+    dispatchAllPendingRequests();
+    return;
   }
 
-  connect();
+  setConnectionRecoveryState("electing_primary");
+  const onElectionError = (error) => {
+    primaryConnectInFlight = false;
+    if (error?.code === "EADDRINUSE") {
+      mode = "client";
+      scheduleClientRecovery("another_client_became_primary", 100);
+      return;
+    }
+    scheduleClientRecovery(error?.message || "primary_election_failed");
+  };
+  tcpServer.once("error", onElectionError);
+  try {
+    tcpServer.listen(TCP_PORT, "127.0.0.1", () => {
+      tcpServer.removeListener("error", onElectionError);
+      clearClientRecoveryTimers();
+      primaryConnectInFlight = false;
+      mode = "primary";
+      primaryConnectedAt = new Date().toISOString();
+      writePidfile();
+      process.stderr.write("Promoted client to primary MCP server on :" + TCP_PORT + "\n");
+      setConnectionRecoveryState(socketReady(nativeHostSocket) ? "connected" : "waiting_for_native_host");
+      dispatchAllPendingRequests();
+    });
+  } catch (error) {
+    tcpServer.removeListener("error", onElectionError);
+    primaryConnectInFlight = false;
+    scheduleClientRecovery(error?.message || "primary_election_exception");
+  }
+}
+
+function startClientMode() {
+  mode = "client";
+  process.stderr.write("Port " + TCP_PORT + " in use. Connecting as client to primary MCP server...\n");
+  setConnectionRecoveryState("connecting_to_primary");
+  connectToPrimaryOrPromote();
 }
 
 // --- Startup: try primary, fall back to client ---
@@ -405,6 +801,9 @@ async function start() {
     tcpServer.listen(TCP_PORT, "127.0.0.1", () => {
       mode = "primary";
       writePidfile();
+      // CLAUDE_SIDEBAR_V67_PRIMARY_STARTED
+      primaryConnectedAt = new Date().toISOString();
+      setConnectionRecoveryState(socketReady(nativeHostSocket) ? "connected" : "waiting_for_native_host");
       process.stderr.write(`Primary MCP server listening on :${TCP_PORT}\n`);
       resolve();
     });
@@ -428,14 +827,342 @@ function mixedResult(parts) {
 }
 
 async function callTool(toolName, args) {
+  // CLAUDE_SIDEBAR_V69_PAGE_BOUND_CALL
+  const preparedPageContext = await prepareBrowserToolArgs(toolName, args || {});
+  if (!preparedPageContext?.ok) return textResult(JSON.stringify(preparedPageContext, null, 2));
+  args = preparedPageContext.args;
+
+  // CLAUDE_SIDEBAR_V66_LEGACY_FULL_READ_GUARD
+  if (toolName === "lark_read" && args?.backend !== "openapi" && ["document", "archive"].includes(String(args?.scope || "").toLowerCase())) {
+    return textResult(JSON.stringify({
+      ok: false,
+      code: "legacy_full_document_read_disabled",
+      reason: "legacy_browser_reader_cannot_verify_virtual_document_completeness",
+      useTool: "lark_deep_read",
+      suggestedArgs: { scope: "map", refresh: true, outlineAssist: true, maxBlocks: 5000, maxSteps: 2000 },
+      doNotClaimComplete: true,
+      readOnly: true
+    }, null, 2));
+  }
+
   try {
-    const result = await sendToExtension(toolName, args);
+    const rawResult = await sendToExtension(toolName, args);
+    const result = await transformBrowserImageResult(toolName, args, rawResult);
     if (typeof result === "string") return textResult(result);
     if (result && result.content) return result;
     return textResult(JSON.stringify(result, null, 2));
   } catch (err) {
     return textResult(`Error: ${err.message}`);
   }
+}
+
+// CLAUDE_SIDEBAR_V69_PAGE_CONTEXT_RUNTIME
+const larkIndexManager = new LarkIndexManager();
+const pageContextManager = new PageContextManager({ implicitIdleMs: 20000, recentPageTtlMs: 21600000, maxRecentPages: 50 });
+let larkDocumentSession = null;
+try { larkIndexManager.cleanupExpired(); } catch {}
+
+const PAGE_BOUND_TOOLS = new Set([
+  "navigate", "computer", "find", "form_input", "get_page_text", "gif_creator",
+  "javascript_tool", "read_console_messages", "read_network_requests", "read_page",
+  "resize_window", "upload_image", "get_screenshot", "lark_document_identity",
+  "lark_deep_read", "lark_locate", "browser_app_inspect", "browser_app_query"
+]);
+
+function parseExtensionJsonResult(result) {
+  const textPart = result?.content?.find?.((part) => part?.type === "text");
+  if (!textPart?.text) return result;
+  try { return JSON.parse(textPart.text); } catch { return { ok: false, code: "extension_result_not_json", raw: textPart.text }; }
+}
+
+async function rawExtensionJson(tool, args = {}) {
+  const result = await sendToExtension(tool, args);
+  return parseExtensionJsonResult(result);
+}
+
+async function captureBrowserPage(options = {}) {
+  return rawExtensionJson("browser_page_context", {
+    action: options.list ? "list" : "capture",
+    tabId: options.tabId,
+  });
+}
+
+async function resolveBrowserTarget(args = {}, options = {}) {
+  const explicitTabId = Number(args?.tabId || 0);
+  const semanticQuery = String(args?.pageHint || args?.query || (Array.isArray(args?.terms) ? args.terms.join(" ") : "") || "");
+  const current = pageContextManager.current();
+  if (current && !current.implicit && options.allowContextOverride !== true) {
+    return pageContextManager.resolve(captureBrowserPage, {
+      taskId: current.mode === "task" ? current.id : undefined,
+      autoStart: false,
+      query: semanticQuery,
+      pageHint: args?.pageHint,
+      allowSemanticRebind: true,
+      preferRecent: options.preferRecent === true,
+    });
+  }
+  if (explicitTabId) return pageContextManager.resolve(captureBrowserPage, { tabId: explicitTabId, autoStart: false });
+  return pageContextManager.resolve(captureBrowserPage, {
+    taskId: args?.taskId,
+    autoStart: options.autoStart !== false,
+    navigationPolicy: args?.allowNavigation === true ? "same_origin" : "same_page",
+    query: semanticQuery,
+    pageHint: args?.pageHint,
+    allowRecentRecovery: true,
+    allowSemanticRebind: true,
+    preferRecent: options.preferRecent === true,
+  });
+}
+
+async function prepareBrowserToolArgs(tool, args = {}) {
+  if (!PAGE_BOUND_TOOLS.has(tool)) return { ok: true, args };
+  let targetArgs = args;
+  let preferRecent = false;
+  if (tool === "browser_app_query") {
+    preferRecent = true;
+  } else if (tool === "browser_app_inspect") {
+    targetArgs = { ...args, query: args.pageHint || "" };
+    preferRecent = true;
+  } else if (["lark_document_identity", "lark_deep_read", "lark_locate"].includes(tool)) {
+    targetArgs = { ...args, query: args.pageHint || "lark feishu" };
+    preferRecent = true;
+  } else {
+    targetArgs = { ...args, query: args.pageHint || "" };
+  }
+  const resolved = await resolveBrowserTarget(targetArgs, { preferRecent });
+  if (!resolved?.ok) return resolved;
+  return {
+    ok: true,
+    args: { ...args, tabId: resolved.identity.tabId },
+    pageContext: resolved.context || null,
+    targetSource: resolved.source,
+  };
+}
+
+async function callExtensionJson(tool, args = {}) {
+  if (tool === "browser_page_context") return rawExtensionJson(tool, args);
+  const prepared = await prepareBrowserToolArgs(tool, args);
+  if (!prepared?.ok) return prepared;
+  const result = await rawExtensionJson(tool, prepared.args);
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    return { ...result, taskPage: prepared.pageContext || undefined, targetSource: prepared.targetSource || undefined };
+  }
+  return result;
+}
+
+async function currentLarkIdentity(tabId) {
+  return callExtensionJson("lark_document_identity", { tabId });
+}
+
+async function locateCurrentLarkTarget(options = {}) {
+  let targetHint = null;
+  let indexMetadata = null;
+  if (options.useIndex !== false) {
+    let loaded = null;
+    if (larkDocumentSession?.indexPath) loaded = larkIndexManager.readIndexPath(larkDocumentSession.indexPath, { touch: true });
+    if (!loaded) {
+      const identity = await currentLarkIdentity(options.tabId);
+      if (identity?.ok) loaded = larkIndexManager.readIndexByUrl(identity.url, { touch: true });
+    }
+    if (loaded?.index) {
+      const hinted = larkIndexManager.locateHint(loaded.index, options.query, { windowRadius: 100 });
+      if (hinted?.found) targetHint = hinted.targetHint;
+      indexMetadata = {
+        exists: true,
+        indexedAt: loaded.index.indexedAt,
+        indexPath: loaded.indexPath,
+        hintFound: hinted?.found === true,
+        targetOrdinal: hinted?.targetHint?.ordinal ?? null,
+      };
+    } else {
+      indexMetadata = { exists: false, indexedAt: null, hintFound: false, targetOrdinal: null };
+    }
+  }
+
+  const result = await callExtensionJson("lark_locate", {
+    ...options,
+    targetHint,
+  });
+  return {
+    ...result,
+    index: indexMetadata,
+  };
+}
+
+async function refreshCurrentLarkIndex(options = {}) {
+  const cleanup = larkIndexManager.cleanupExpired();
+  const map = await callExtensionJson("lark_deep_read", {
+    scope: "map",
+    tabId: options.tabId,
+    refresh: true,
+    maxBlocks: options.maxBlocks || 10000,
+    maxSteps: options.maxSteps || 4000,
+    maxTargets: options.maxTargets || 5,
+    settleMs: options.settleMs || 80,
+    requireOutlineCoverage: options.requireOutlineCoverage,
+  });
+  if (!map?.ok) return { ok: false, code: map?.code || "index_map_failed", detail: map, cleanup };
+  if (map.scan?.complete !== true) {
+    return {
+      ok: false,
+      code: "source_scan_incomplete",
+      documentName: map.title,
+      documentUrl: map.url,
+      scan: map.scan,
+      doNotReplaceExistingIndex: true,
+      cleanup,
+    };
+  }
+
+  const blockCount = Number(map.blockCount || 0);
+  const blocks = [];
+  const chunkSize = Math.max(100, Math.min(1000, Number(options.chunkSize || 800)));
+  for (let startOrdinal = 0; startOrdinal < blockCount; startOrdinal += chunkSize) {
+    const endOrdinal = Math.min(blockCount - 1, startOrdinal + chunkSize - 1);
+    const range = await callExtensionJson("lark_deep_read", {
+      scope: "range",
+      tabId: options.tabId,
+      startOrdinal,
+      endOrdinal,
+      maxReturnBlocks: chunkSize,
+      maxBlocks: options.maxBlocks || 10000,
+      refresh: false,
+    });
+    if (!range?.ok || !Array.isArray(range.blocks)) {
+      return {
+        ok: false,
+        code: "index_range_failed",
+        failedRange: { startOrdinal, endOrdinal },
+        detail: range,
+        doNotReplaceExistingIndex: true,
+        cleanup,
+      };
+    }
+    blocks.push(...range.blocks);
+  }
+
+  if (blocks.length !== blockCount) {
+    return {
+      ok: false,
+      code: "index_block_count_mismatch",
+      expectedBlockCount: blockCount,
+      actualBlockCount: blocks.length,
+      doNotReplaceExistingIndex: true,
+      cleanup,
+    };
+  }
+
+  const saved = larkIndexManager.writeIndex({
+    documentName: map.title,
+    documentUrl: map.url,
+    documentType: map.scan?.documentType || map.documentType || "rich_doc",
+    blockCount,
+    scan: map.scan,
+    sections: map.sections || [],
+    blocks,
+  });
+  larkDocumentSession = {
+    mode: options.sessionMode || "new",
+    indexPath: saved.indexPath,
+    documentName: saved.index.documentName,
+    documentUrl: saved.index.documentUrl,
+    indexedAt: saved.index.indexedAt,
+  };
+  return {
+    ok: true,
+    action: "index_refreshed",
+    sessionMode: larkDocumentSession.mode,
+    indexPath: saved.indexPath,
+    documentName: saved.index.documentName,
+    documentUrl: saved.index.documentUrl,
+    indexedAt: saved.index.indexedAt,
+    lastOpenedAt: saved.index.lastOpenedAt,
+    blockCount: saved.index.blockCount,
+    indexedBlockCount: saved.index.indexedBlockCount,
+    sectionCount: saved.index.sectionCount,
+    cleanup,
+  };
+}
+
+async function startLarkDocumentSession(options = {}) {
+  const mode = options.mode === "history" ? "history" : "new";
+  if (mode === "new") return refreshCurrentLarkIndex({ ...options, sessionMode: "new" });
+
+  const cleanup = larkIndexManager.cleanupExpired();
+  const identity = await currentLarkIdentity(options.tabId);
+  if (!identity?.ok) return { ok: false, code: identity?.code || "document_identity_failed", detail: identity, cleanup };
+  const loaded = larkIndexManager.readIndexByUrl(identity.url, { touch: true });
+  if (!loaded) {
+    larkDocumentSession = null;
+    return {
+      ok: true,
+      action: "history_index_missing",
+      sessionMode: "history",
+      documentName: identity.title,
+      documentUrl: identity.url,
+      indexExists: false,
+      userAction: "Ask Claude to refresh the current document index.",
+      cleanup,
+    };
+  }
+  larkDocumentSession = {
+    mode: "history",
+    indexPath: loaded.indexPath,
+    documentName: loaded.index.documentName,
+    documentUrl: loaded.index.documentUrl,
+    indexedAt: loaded.index.indexedAt,
+  };
+  return {
+    ok: true,
+    action: "history_index_loaded",
+    sessionMode: "history",
+    indexExists: true,
+    indexPath: loaded.indexPath,
+    documentName: loaded.index.documentName,
+    documentUrl: loaded.index.documentUrl,
+    indexedAt: loaded.index.indexedAt,
+    lastOpenedAt: loaded.index.lastOpenedAt,
+    blockCount: loaded.index.blockCount,
+    sectionCount: loaded.index.sectionCount,
+    cleanup,
+  };
+}
+
+async function ensureLarkQuerySession(options = {}) {
+  if (options.refresh === true) return refreshCurrentLarkIndex({ ...options, sessionMode: larkDocumentSession?.mode || options.sessionMode || "new" });
+  if (larkDocumentSession?.indexPath) {
+    const loaded = larkIndexManager.readIndexPath(larkDocumentSession.indexPath, { touch: true });
+    if (loaded) return { ok: true, loaded };
+    larkDocumentSession = null;
+  }
+
+  if (options.sessionMode === "new") {
+    const refreshed = await refreshCurrentLarkIndex({ ...options, sessionMode: "new" });
+    if (!refreshed.ok) return refreshed;
+    return { ok: true, loaded: larkIndexManager.readIndexPath(refreshed.indexPath, { touch: true }) };
+  }
+
+  const identity = await currentLarkIdentity(options.tabId);
+  if (!identity?.ok) return { ok: false, code: identity?.code || "document_identity_failed", detail: identity };
+  const loaded = larkIndexManager.readIndexByUrl(identity.url, { touch: true });
+  if (!loaded) {
+    return {
+      ok: false,
+      code: "index_missing",
+      documentName: identity.title,
+      documentUrl: identity.url,
+      indexedAt: null,
+      userAction: "Refresh the current document index before asking detailed questions.",
+    };
+  }
+  larkDocumentSession = {
+    mode: options.sessionMode || "history",
+    indexPath: loaded.indexPath,
+    documentName: loaded.index.documentName,
+    documentUrl: loaded.index.documentUrl,
+    indexedAt: loaded.index.indexedAt,
+  };
+  return { ok: true, loaded };
 }
 
 // --- MCP Server with all 18 tools ---
@@ -470,7 +1197,7 @@ const server = new McpServer({
 // 1. tabs_context_mcp
 server.tool(
   "tabs_context_mcp",
-  "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
+  "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. A browser side-panel session may expose an explicitly adopted current tab. Reuse that tab when the user asks about the current page. Otherwise create a new tab for unrelated browsing tasks.",
   { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
   async (args) => callTool("tabs_context_mcp", args)
 );
@@ -478,7 +1205,7 @@ server.tool(
 // 2. tabs_create_mcp
 server.tool(
   "tabs_create_mcp",
-  "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
+  "Creates a new empty tab in the MCP tab group. Do not use this when the user explicitly refers to an adopted current browser tab. Get context with tabs_context_mcp first.",
   {},
   async (args) => callTool("tabs_create_mcp", args)
 );
@@ -497,7 +1224,7 @@ server.tool(
 // 4. computer
 server.tool(
   "computer",
-  "Use a mouse and keyboard to interact with a web browser, and take screenshots. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.\n* Whenever you intend to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your click location so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.",
+  "Use a mouse and keyboard to interact with a web browser, and take screenshots. On macOS Claude Sidebar may run in safe-text image mode: screenshot/zoom/scroll still execute in Chrome but return an accessibility snapshot instead of MCP image content. Do not repeatedly retry screenshots when the safe-mode notice is returned. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.\n* Whenever you intend to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your click location so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.",
   {
     action: z.enum([
       "left_click", "right_click", "double_click", "triple_click",
@@ -693,7 +1420,278 @@ server.tool(
   async (args) => callTool("upload_image", args)
 );
 
+
+// --- Dynamic capability adapters ---
+capabilityRegistry = new CapabilityRegistry(server);
+const larkAdapter = registerLarkAdapter({
+  server,
+  z,
+  getContext: () => getEffectiveBrowserContext(),
+  sendToExtension,
+});
+capabilityRegistry.registerAdapter(larkAdapter);
+capabilityRegistry.updateContext(currentBrowserContext);
+
 // --- Start MCP server ---
+
+
+// CLAUDE_SIDEBAR_V69_ALPHA9_PAGE_CONTEXT_TOOL
+server.tool(
+  "sidebar_connection_status",
+  "Return local MCP primary/client and browser native-host connection diagnostics. This tool does not call the browser and remains available while the browser transport is recovering.",
+  {},
+  async () => textResult(JSON.stringify(getSidebarConnectionStatus(), null, 2))
+);
+
+server.tool(
+  "browser_page_context",
+  "Manage and recover the page bound to the current browser task across the entire browser, not only the MCP tab group. At task start, pass pageHint when the user names an app/site/resource such as K8s, Jenkins or a document. Existing matching tabs are reused without activation; switching the visible tab does not close or replace the task page. list_pages returns every open browser tab. Never open a duplicate page before checking this tool.",
+  {
+    action: z.enum(["start_task", "end_task", "pin_current", "follow_current", "status", "list_pages"]),
+    tabId: z.number().optional(),
+    taskId: z.string().optional(),
+    alias: z.string().optional(),
+    pageHint: z.string().optional().describe("Natural-language app, site, title, host or resource hint used to recover an already-open tab across all browser windows."),
+    allowNavigation: z.boolean().optional().describe("Allow same-origin route changes in the bound tab. Defaults to false so accidental page navigation is detected."),
+  },
+  async (args) => {
+    const policy = args.allowNavigation === true ? "same_origin" : "same_page";
+    let result;
+    if (args.action === "start_task") {
+      if (pageContextManager.activeTaskId) pageContextManager.end(pageContextManager.activeTaskId, "replaced_by_new_task");
+      result = await pageContextManager.start(captureBrowserPage, {
+        mode: "task",
+        tabId: args.tabId,
+        alias: args.alias,
+        pageHint: args.pageHint,
+        query: args.pageHint,
+        navigationPolicy: policy,
+      });
+    } else if (args.action === "end_task") {
+      result = { ok: true, action: "task_ended", context: pageContextManager.end(args.taskId || pageContextManager.activeTaskId, "completed") };
+    } else if (args.action === "pin_current") {
+      pageContextManager.unpin();
+      result = await pageContextManager.start(captureBrowserPage, {
+        mode: "pinned",
+        tabId: args.tabId,
+        alias: args.alias,
+        pageHint: args.pageHint,
+        query: args.pageHint,
+        navigationPolicy: policy,
+      });
+    } else if (args.action === "follow_current") {
+      const task = pageContextManager.activeTaskId ? pageContextManager.end(pageContextManager.activeTaskId, "follow_current") : null;
+      const pin = pageContextManager.unpin();
+      result = { ok: true, action: "follow_current_enabled", releasedTask: task, releasedPin: pin };
+    } else if (args.action === "list_pages") {
+      result = await captureBrowserPage({ list: true });
+    } else {
+      result = pageContextManager.status();
+    }
+    return textResult(JSON.stringify(result, null, 2));
+  }
+);
+
+server.tool(
+  "lark_session_start",
+  "Lifecycle tool for the Sidebar. Call with mode=new when a new conversation is created: code refreshes the current Lark index before the conversation uses it. Call with mode=history when reopening a historical conversation: code loads the existing local index without refreshing and returns the last indexed time.",
+  {
+    mode: z.enum(["new", "history"]),
+    tabId: z.number().optional(),
+    maxBlocks: z.number().int().min(1).max(20000).optional(),
+    maxSteps: z.number().int().min(1).max(4000).optional(),
+    chunkSize: z.number().int().min(100).max(1000).optional(),
+  },
+  async (args) => textResult(JSON.stringify(await startLarkDocumentSession(args), null, 2))
+);
+
+server.tool(
+  "lark_index_refresh",
+  "Refresh the local index for the current Lark document. Claude should call this only after the user explicitly asks to update, refresh, reread, or answer from the latest document. The code performs scanning, indexing and atomic file replacement.",
+  {
+    tabId: z.number().optional(),
+    maxBlocks: z.number().int().min(1).max(20000).optional(),
+    maxSteps: z.number().int().min(1).max(4000).optional(),
+    chunkSize: z.number().int().min(100).max(1000).optional(),
+  },
+  async (args) => textResult(JSON.stringify(await refreshCurrentLarkIndex({ ...args, sessionMode: larkDocumentSession?.mode || "history" }), null, 2))
+);
+
+server.tool(
+  "lark_index_status",
+  "Return whether the current Lark document has a local index and its last indexed time. This does not refresh document content.",
+  { tabId: z.number().optional() },
+  async (args) => {
+    const identity = await currentLarkIdentity(args.tabId);
+    if (!identity?.ok) return textResult(JSON.stringify(identity, null, 2));
+    const loaded = larkIndexManager.readIndexByUrl(identity.url, { touch: true });
+    return textResult(JSON.stringify(loaded ? {
+      ok: true,
+      exists: true,
+      documentName: loaded.index.documentName,
+      documentUrl: loaded.index.documentUrl,
+      indexPath: loaded.indexPath,
+      indexedAt: loaded.index.indexedAt,
+      lastOpenedAt: loaded.index.lastOpenedAt,
+      blockCount: loaded.index.blockCount,
+      sectionCount: loaded.index.sectionCount,
+    } : {
+      ok: true,
+      exists: false,
+      documentName: identity.title,
+      documentUrl: identity.url,
+      indexedAt: null,
+    }, null, 2));
+  }
+);
+
+server.tool(
+  "lark_query",
+  "Query the local index of the current Lark document in one call. It returns compact relevant source context and the index timestamp so Claude can answer directly. It does not refresh a historical session unless refresh=true or the user explicitly asked for an update.",
+  {
+    question: z.string().min(1),
+    tabId: z.number().optional(),
+    sessionMode: z.enum(["new", "history"]).optional(),
+    refresh: z.boolean().optional(),
+    limit: z.number().int().min(1).max(20).optional(),
+    contextBefore: z.number().int().min(0).max(5).optional(),
+    contextAfter: z.number().int().min(0).max(5).optional(),
+    maxContextChars: z.number().int().min(500).max(30000).optional(),
+  },
+  async (args) => {
+    const session = await ensureLarkQuerySession(args);
+    if (!session?.ok) return textResult(JSON.stringify(session, null, 2));
+    const queried = larkIndexManager.query(session.loaded.index, args.question, args);
+    return textResult(JSON.stringify({
+      ...queried,
+      indexPath: session.loaded.indexPath,
+      sessionMode: larkDocumentSession?.mode || args.sessionMode || "history",
+      indexNotice: "This answer context is based on the local index updated at " + session.loaded.index.indexedAt + ".",
+    }, null, 2));
+  }
+);
+
+server.tool(
+  "lark_index_cleanup",
+  "Delete local Lark indexes that have not been opened for more than the retention period. Default retention is 30 days. Normally invoked automatically by code.",
+  { retentionDays: z.number().int().min(1).max(365).optional() },
+  async (args) => textResult(JSON.stringify(larkIndexManager.cleanupExpired(args), null, 2))
+);
+
+server.tool(
+  "lark_deep_read",
+  "Read a large current Lark/Feishu document without modifying it. Use scope=map first. The outline is optional and only acts as completeness evidence for rich documents; it is never clicked. Search defaults to leaf blocks, removes aggregate-container hits, merges adjacent duplicates, and supports cursor pagination.",
+  {
+    scope: z.enum(["map", "section", "range", "search"]).default("map"),
+    tabId: z.number().optional(),
+    sectionId: z.string().optional(),
+    sectionTitle: z.string().optional(),
+    startOrdinal: z.number().int().nonnegative().optional(),
+    endOrdinal: z.number().int().nonnegative().optional(),
+    query: z.string().optional(),
+    caseSensitive: z.boolean().optional(),
+    contextBefore: z.number().int().min(0).max(20).optional(),
+    contextAfter: z.number().int().min(0).max(20).optional(),
+    limit: z.number().int().min(1).max(200).optional(),
+    cursor: z.number().int().nonnegative().optional(),
+    leafOnly: z.boolean().optional(),
+    includeContainers: z.boolean().optional(),
+    withinSection: z.string().optional(),
+    blockTypes: z.array(z.string()).optional(),
+    maxTextCharsPerMatch: z.number().int().min(80).max(10000).optional(),
+    maxTotalChars: z.number().int().min(1000).max(200000).optional(),
+    maxReturnBlocks: z.number().int().min(1).max(1000).optional(),
+    maxBlocks: z.number().int().min(1).max(20000).optional(),
+    maxSteps: z.number().int().min(1).max(4000).optional(),
+    maxTargets: z.number().int().min(1).max(5).optional(),
+    bottomStableSteps: z.number().int().min(3).max(20).optional(),
+    outlineAssist: z.boolean().optional().describe("Deprecated compatibility flag. The reader never clicks the outline."),
+    requireOutlineCoverage: z.boolean().optional().describe("Require complete outline coverage when the detected type is rich_doc."),
+    maxOutlineEntries: z.number().int().min(1).max(500).optional(),
+    settleMs: z.number().int().min(20).max(1200).optional(),
+    refresh: z.boolean().optional().describe("Force a fresh browser scan instead of using the short-lived complete document-map cache."),
+  },
+  async (args) => callTool("lark_deep_read", args)
+);
+
+server.tool(
+  "lark_locate",
+  "Locate text in the current Lark/Feishu content with the reusable indexed virtual-scroll seek engine. The host enriches the request with local index position anchors when available, then the browser performs coarse positioning, adaptive correction and DOM visibility verification. The tool never clicks, presses keys, or uses screenshot recognition.",
+  {
+    query: z.string().min(1),
+    tabId: z.number().optional(),
+    strategy: z.enum(["auto", "dom", "table", "virtual_scroll", "scroll_only"]).default("auto"),
+    documentType: z.enum(["auto", "rich_doc", "sheet", "table", "canvas", "generic_page"]).default("auto"),
+    matchMode: z.enum(["contains", "exact", "regex"]).default("contains"),
+    caseSensitive: z.boolean().optional(),
+    contextBefore: z.number().int().min(0).max(10).optional(),
+    contextAfter: z.number().int().min(0).max(10).optional(),
+    maxContextChars: z.number().int().min(200).max(20000).optional(),
+    maxSteps: z.number().int().min(1).max(5000).optional(),
+    maxTargets: z.number().int().min(1).max(5).optional(),
+    settleMs: z.number().int().min(20).max(1200).optional(),
+    stableChecks: z.number().int().min(2).max(5).optional(),
+    useIndex: z.boolean().optional().describe("Use the current local document index to provide target ordinal and position anchors. Defaults to true."),
+    searchFromTop: z.boolean().optional(),
+    restoreOnNotFound: z.boolean().optional(),
+    block: z.enum(["start", "center", "end", "nearest"]).optional(),
+  },
+  async (args) => textResult(JSON.stringify(await locateCurrentLarkTarget(args), null, 2))
+);
+
+
+server.tool(
+  "browser_app_inspect",
+  "Inspect any modern Web application as structured read-only state. It can recover an already-open matching tab across all browser windows and must not reopen a page merely because it is outside the MCP tab group. Returns route, query parameters, active controls and filters, breadcrumbs, navigation, pagination, tables, grids, lists, detail fields and artifact references without screenshots, clicks, keyboard input or URL mutation. Use this for management consoles, dashboards and internal admin systems before attempting visual interaction.",
+  {
+    tabId: z.number().optional(),
+    pageHint: z.string().optional().describe("Optional app/site/title/host hint for reusing an already-open tab instead of the current active tab."),
+    maxControls: z.number().int().min(1).max(250).optional(),
+    maxSurfaces: z.number().int().min(1).max(12).optional(),
+    maxNavigationLinks: z.number().int().min(1).max(250).optional(),
+    maxDetailPairs: z.number().int().min(1).max(400).optional(),
+    maxTextChars: z.number().int().min(1000).max(60000).optional(),
+  },
+  async (args) => callTool("browser_app_inspect", args)
+);
+
+server.tool(
+  "browser_app_query",
+  "Query any modern Web application in one read-only call. It searches all open browser tabs for a semantic page match and reuses an existing page before considering the active tab; never open a duplicate just because the user switched tabs. Searches tables, ARIA grids, virtual lists, cards, detail fields, embedded application state and observed same-origin JSON GET endpoints. Use it when the visible list does not expose the real entity name and the answer may be nested in command, args, image, metadata or configuration data. The result includes resolvedEntities with concrete resource names and evidence paths; do not stop at a vague statement when resolvedEntities is non-empty. It never operates the page search UI and never sends write requests.",
+  {
+    query: z.string().min(1),
+    terms: z.array(z.string().min(1)).max(20).optional(),
+    fields: z.array(z.string().min(1)).max(30).optional(),
+    tabId: z.number().optional(),
+    pageHint: z.string().optional().describe("Optional app/site/title/host hint. The natural-language query is also used to recover a matching already-open tab."),
+    matchMode: z.enum(["contains", "exact", "regex"]).default("contains"),
+    caseSensitive: z.boolean().optional(),
+    maxSteps: z.number().int().min(1).max(2500).optional(),
+    maxRows: z.number().int().min(1).max(1000).optional(),
+    maxSurfaces: z.number().int().min(1).max(12).optional(),
+    settleMs: z.number().int().min(20).max(1200).optional(),
+    stopAfterMatches: z.number().int().min(1).max(1000).optional(),
+    scanToBottom: z.boolean().optional(),
+    searchFromTop: z.boolean().optional(),
+    restoreScroll: z.boolean().optional(),
+    followDetails: z.enum(["auto", "never", "always"]).default("auto"),
+    maxDetailLinks: z.number().int().min(1).max(3).optional(),
+    detailTimeoutMs: z.number().int().min(3000).max(30000).optional(),
+    detailSettleMs: z.number().int().min(200).max(3000).optional(),
+    dataMode: z.enum(["auto", "never", "always"]).default("auto").describe("Read embedded state and, when needed, observed same-origin JSON GET data sources. auto fetches network data when DOM results are absent or requested fields are missing."),
+    deepSearch: z.boolean().optional().describe("Force nested structured-data search even when a visible DOM row already matched."),
+    maxDataSources: z.number().int().min(1).max(12).optional(),
+    maxDataMatches: z.number().int().min(1).max(200).optional(),
+    maxResolvedEntities: z.number().int().min(1).max(100).optional(),
+    maxDataNodes: z.number().int().min(100).max(250000).optional(),
+    maxDataDepth: z.number().int().min(1).max(40).optional(),
+    maxContextFields: z.number().int().min(1).max(300).optional(),
+    maxDataBytes: z.number().int().min(10000).max(10000000).optional(),
+    dataTimeoutMs: z.number().int().min(500).max(20000).optional(),
+  },
+  async (args) => callTool("browser_app_query", args)
+);
+
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
