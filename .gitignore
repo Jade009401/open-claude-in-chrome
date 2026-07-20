@@ -1,6 +1,7 @@
 node_modules/
 host/native-host-wrapper.sh
 .env
+.env.local
 *.log
 .DS_Store
 
