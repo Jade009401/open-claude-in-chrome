@@ -62,6 +62,8 @@ export function assertLarkCredentials() {
 const QA_CONFIG_PATH = join(HERE, 'qa-config.json');
 const DEFAULT_WRITE_KEYWORDS = ['删除', '支付', '提交', '下单', '确认付款', 'approve', 'delete', 'pay', 'submit', 'remove'];
 const DEFAULT_WRITE_ACTIONS = ['click', 'input', 'select', 'submit'];
+// 自动导航后若被重定向到含这些关键词的 URL,判为登录页 → 暂停等用户登录。上线按实际后台登录路径调。
+const DEFAULT_LOGIN_URL_KEYWORDS = ['login', 'signin', 'sign-in', 'sso', 'passport', '/auth', 'oauth'];
 
 export function loadQaConfig() {
   let file = {};
@@ -74,5 +76,6 @@ export function loadQaConfig() {
     envWhitelist: Array.isArray(file.envWhitelist) ? file.envWhitelist : [],
     writeKeywords: Array.isArray(file.writeKeywords) ? file.writeKeywords : DEFAULT_WRITE_KEYWORDS,
     writeActions: Array.isArray(file.writeActions) ? file.writeActions : DEFAULT_WRITE_ACTIONS,
+    loginUrlKeywords: Array.isArray(file.loginUrlKeywords) ? file.loginUrlKeywords : DEFAULT_LOGIN_URL_KEYWORDS,
   };
 }

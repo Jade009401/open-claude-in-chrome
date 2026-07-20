@@ -1,17 +1,22 @@
 // QA 编排器(Task 7):把各模块串成一次任务。触发无关 —— runTask(prdInput, deps)。
 // 依赖全注入,便于测试;真实接线(飞书/浏览器/claude)由触发层组装 deps 后调用。
 //
-// 链路:读PRD → (routeKey 若原生App 过环境门槛) → 生成脚本 → 人审(A,必经) →
-//       逐步重放(先白名单校验、写操作需确认) → 三态判定+证据 → 汇总 →
-//       按 routeKey 路由 → 写结果表 + 播报(含文档URL,透明)。
+// 链路:读PRD → 读路由键喂生成器 → 生成脚本(含 routeKey+entryUrl) →
+//       (routeKey 若原生App 过环境门槛) → 人审(A,必经) →
+//       用 script.entryUrl 建图(prepareTarget) → 逐步重放(先白名单校验、写操作需确认) →
+//       三态判定+证据 → 汇总 → 按 routeKey 路由 → 写结果表 + 播报(含文档URL,透明)。
 //
 // deps: {
-//   readDoc(prdInput), generate(prd), reviewScript(script),
-//   replayStep(step, stepDeps), judge(step,result), buildEvidence(step,judged),
+//   readDoc(prdInput), listRouteKeys()?, generate(prd,{routeKeys}), reviewScript(script),
+//   prepareTarget(target,{pauseOnLogin})?→{url,isLogin}, onLoginRequired(url)?, replayStep(step, stepDeps),
+//   judge(step,result), buildEvidence(step,judged),
 //   resolveTargets(routeKey), writeRunRecord(token,tableId,fields), broadcast(chatId,text),
-//   assertUrlAllowed(url,whitelist)? , assertAppEnvGate(端)? ,
-//   url, whitelist, rules, confirm, locate, act,
+//   assertAppEnvGate(端)? , pinnedTab?{tabId,url}, entryUrlOverride?,
+//   lookupSystem(routeKey,featureMenu)?→{url,note}|null, recordSystem(routeKey,featureMenu,url)?,
+//   whitelist, rules, confirm, safety,
 // }
+// 被测目标 target = { tabId?, url, navigate?, source } —— navigate=true 先把 tab 导到 url 再建图;
+//   有 tabId 走固定 tab,否则按 url(pageQuery)。source: memory|current_tab|override|prd_entry_url。
 
 function fail(reason, extra = {}) {
   return { ok: false, reason: typeof reason === 'string' ? reason : reason?.code, error: reason, ...extra };
@@ -22,9 +27,15 @@ async function runTask(prdInput, deps = {}) {
   // 1. 读 PRD
   const prd = await deps.readDoc(prdInput);
 
-  // 2. 生成脚本(headless claude,B′)
-  const gen = await deps.generate(prd);
-  if (!gen?.ok) return fail(gen?.error || '脚本生成异常', { stage: 'generate' });
+  // 1.5 读路由总表已有键(best-effort),喂给生成器让 AI 选 routeKey;读不到就空表,让 AI 标「待人工」。
+  let routeKeys = [];
+  if (deps.listRouteKeys) {
+    try { routeKeys = await deps.listRouteKeys(); } catch { routeKeys = []; }
+  }
+
+  // 2. 生成脚本(headless claude,B′):产出含 routeKey + entryUrl。
+  const gen = await deps.generate(prd, { routeKeys });
+  if (!gen?.ok) return fail(gen?.error || '脚本生成异常', { stage: 'generate', reason: gen?.reason });
   const script0 = gen.script;
 
   // 3. 原生 App 环境门槛(fail-closed):按脚本 routeKey 的"端"判定
@@ -40,13 +51,45 @@ async function runTask(prdInput, deps = {}) {
   const script = review.script || script0;
   const routeKey = script.routeKey;
 
+  // 4.5 定被测目标:先查项目记忆里的访问录(routeKey + featureMenu)。
+  //   命中记忆 → 自动导航当前 tab 到记录 URL(复用登录会话);
+  //   首次未命中 → 用当前打开的页当入口,重放跑完后沉淀 (routeKey,featureMenu)->当前URL;
+  //   无当前页 → 手输 URL / PRD entryUrl 兜底;都没有 → 停(no_target)。
+  const featureMenu = script.featureMenu || '';
+  const remembered = deps.lookupSystem ? deps.lookupSystem(routeKey, featureMenu) : null;
+  let target = null;
+  let sediment = null; // 跑完要沉淀的 { routeKey, featureMenu, url }
+  if (remembered?.url) {
+    target = { tabId: deps.pinnedTab?.tabId || null, url: remembered.url, navigate: true, source: 'memory' };
+  } else if (deps.pinnedTab?.tabId) {
+    target = { tabId: deps.pinnedTab.tabId, url: deps.pinnedTab.url || '', navigate: false, source: 'current_tab' };
+    if (featureMenu && deps.pinnedTab.url) sediment = { routeKey, featureMenu, url: deps.pinnedTab.url };
+  } else if (deps.entryUrlOverride) {
+    target = { url: deps.entryUrlOverride, navigate: true, source: 'override' };
+  } else if (script.entryUrl) {
+    target = { url: script.entryUrl, navigate: true, source: 'prd_entry_url' };
+  }
+  if (!target || (!target.tabId && !target.url)) return fail('no_target', { stage: 'entry' });
+  // 建图(懒起浏览器 + 命中记忆则先导航 + 白名单校验)。白名单外/非法 URL 在此抛错停下。
+  if (deps.prepareTarget) {
+    let prep;
+    try { prep = await deps.prepareTarget(target); }
+    catch (e) { return fail(e, { stage: 'prepare' }); }
+    // 落在登录页(会话过期)→ 暂停等用户登录,登完重试一次(仍在登录页也照跑,结果会是不确定)。
+    if (prep?.isLogin && deps.onLoginRequired) {
+      await deps.onLoginRequired(prep.url);
+      try { await deps.prepareTarget(target, { pauseOnLogin: false }); }
+      catch (e) { return fail(e, { stage: 'prepare' }); }
+    }
+  }
+
   // 5. 逐步重放(先白名单校验;写操作需确认;锚点失效 uncertain;无自愈)
   const stepResults = [];
   try {
     for (const step of script.steps || []) {
       const result = await deps.replayStep(step, {
-        url: deps.url, whitelist: deps.whitelist, rules: deps.rules,
-        locate: deps.locate, act: deps.act, confirm: deps.confirm, safety: deps.safety,
+        target, whitelist: deps.whitelist, rules: deps.rules,
+        confirm: deps.confirm, safety: deps.safety,
       });
       // 6. 三态判定 + 证据
       const judged = deps.judge(step, result);
@@ -56,6 +99,11 @@ async function runTask(prdInput, deps = {}) {
   } catch (e) {
     // 白名单外等致命错 → 整体停(不写脏结果)
     return fail(e, { stage: 'replay' });
+  }
+
+  // 6.5 首次沉淀:重放跑完(不管三态)→ 把这个功能菜单的入口记进访问录,下次自动导航。
+  if (sediment && deps.recordSystem) {
+    try { deps.recordSystem(sediment.routeKey, sediment.featureMenu, sediment.url); } catch {}
   }
 
   // 7. 汇总

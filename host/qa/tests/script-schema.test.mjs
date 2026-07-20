@@ -5,6 +5,8 @@ import { validateScript } from '../script-schema.mjs';
 
 const VALID = {
   requirementIds: ['R1', 'R2'],
+  routeKey: '用户端-理财',
+  entryUrl: 'https://www-local.biconomy.vip/finance',
   steps: [
     { action: 'navigate', target: '登录页', expected: '', requirementId: 'R1' },
     { action: 'assert_text', target: '页面标题', expected: '登录', requirementId: 'R1' },
@@ -50,4 +52,27 @@ test('requirementIds 空 / steps 空 失败', () => {
 test('非对象输入不抛错,返回 ok:false', () => {
   assert.equal(validateScript(null).ok, false);
   assert.equal(validateScript('x').ok, false);
+});
+
+test('缺 routeKey 失败', () => {
+  const { routeKey, ...bad } = VALID;
+  const r = validateScript(bad);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.includes('routeKey')), '应报 routeKey 缺失');
+});
+
+test('缺 entryUrl 也能过(默认测当前 tab,entryUrl 可选)', () => {
+  const { entryUrl, ...noEntry } = VALID;
+  const r = validateScript(noEntry);
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+});
+
+test('routeKey 填「待人工」可过 schema(留到路由步骤暴露)', () => {
+  const r = validateScript({ ...VALID, routeKey: '待人工' });
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+});
+
+test('featureMenu 可选:带上能过,非字符串失败', () => {
+  assert.equal(validateScript({ ...VALID, featureMenu: '系统配置 > VIP配置' }).ok, true);
+  assert.equal(validateScript({ ...VALID, featureMenu: 123 }).ok, false);
 });

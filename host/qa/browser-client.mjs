@@ -87,6 +87,8 @@ class BrowserClient {
   locate(args) { return this.callTool('browser_locate', args); }
   read(args) { return this.callTool('browser_read', args); }
   act(args) { return this.callTool('browser_act', args); }
+  navigate(args) { return this.callTool('navigate', args); } // 把指定 tab 导到 URL(复用会话)
+  pageContext(args) { return this.callTool('__pure_map_page_context', args); } // 读当前页真实 URL(检测重定向到登录页)
   close() { try { this.socket?.destroy(); } catch {} }
 }
 
