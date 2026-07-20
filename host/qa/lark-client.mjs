@@ -128,4 +128,49 @@ async function readDoc(input, { client } = {}) {
   };
 }
 
-export { hasTableBlock, extractRefs, createClient, resolveDocumentId, readDoc, TABLE_BLOCK_TYPE };
+// —— Task 6 输出层:写结果表(bitable)+ 播报(im)——
+
+// 取一个 bitable 的第一张数据表 table_id。
+async function firstTableId(client, appToken) {
+  const tl = await client.bitable.v1.appTable.list({ path: { app_token: appToken }, params: { page_size: 20 } });
+  return tl.data?.items?.[0]?.table_id || null;
+}
+
+// 往结果表写一条运行记录。fields 为 { 用例, AI判定, 耗时ms, 证据链接, 人工改判, 脚本改动 }(值均字符串)。
+async function writeRunRecord(client, appToken, tableId, fields) {
+  const r = await client.bitable.v1.appTableRecord.create({
+    path: { app_token: appToken, table_id: tableId },
+    data: { fields },
+  });
+  if (r.code) throw new Error(`writeRunRecord 失败 code=${r.code} msg=${r.msg}`);
+  return r.data?.record?.record_id;
+}
+
+// 读回结果表全部行(供止损计算)。
+async function listRunRecords(client, appToken, tableId) {
+  const rr = await client.bitable.v1.appTableRecord.list({ path: { app_token: appToken, table_id: tableId }, params: { page_size: 500 } });
+  return rr.data?.items || [];
+}
+
+// 播报到群(纯文本)。Phase 0:每次运行一张汇总卡 + 涉及文档 URL(透明审计流)。
+async function broadcast(client, chatId, text) {
+  const r = await client.im.v1.message.create({
+    params: { receive_id_type: 'chat_id' },
+    data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) },
+  });
+  if (r.code) throw new Error(`broadcast 失败 code=${r.code} msg=${r.msg}`);
+  return r.data?.message_id;
+}
+
+export {
+  hasTableBlock,
+  extractRefs,
+  createClient,
+  resolveDocumentId,
+  readDoc,
+  TABLE_BLOCK_TYPE,
+  firstTableId,
+  writeRunRecord,
+  listRunRecords,
+  broadcast,
+};
