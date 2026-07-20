@@ -56,3 +56,23 @@ export function assertLarkCredentials() {
     );
   }
 }
+
+// —— QA 安全配置(host/qa/qa-config.json,不进 git)——
+// 缺文件时 fail-safe:白名单为空 = 全拒;关键词/动作用内置默认。
+const QA_CONFIG_PATH = join(HERE, 'qa-config.json');
+const DEFAULT_WRITE_KEYWORDS = ['删除', '支付', '提交', '下单', '确认付款', 'approve', 'delete', 'pay', 'submit', 'remove'];
+const DEFAULT_WRITE_ACTIONS = ['click', 'input', 'select', 'submit'];
+
+export function loadQaConfig() {
+  let file = {};
+  try {
+    file = JSON.parse(readFileSync(QA_CONFIG_PATH, 'utf8'));
+  } catch {
+    // 无配置文件:走 fail-safe 默认(白名单空=全拒)
+  }
+  return {
+    envWhitelist: Array.isArray(file.envWhitelist) ? file.envWhitelist : [],
+    writeKeywords: Array.isArray(file.writeKeywords) ? file.writeKeywords : DEFAULT_WRITE_KEYWORDS,
+    writeActions: Array.isArray(file.writeActions) ? file.writeActions : DEFAULT_WRITE_ACTIONS,
+  };
+}

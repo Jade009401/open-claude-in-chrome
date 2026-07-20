@@ -1,0 +1,6 @@
+{
+  "_说明": "复制本文件为 qa-config.json(不进 git)并按你的环境填写。envWhitelist 只填测试环境域名(生产一律不填=拒绝)。writeKeywords/writeActions 可增删。",
+  "envWhitelist": ["test.example.com", "staging.example.com"],
+  "writeKeywords": ["删除", "支付", "提交", "下单", "确认付款", "approve", "delete", "pay", "submit", "remove"],
+  "writeActions": ["click", "input", "select", "submit"]
+}

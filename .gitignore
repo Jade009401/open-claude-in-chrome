@@ -2,6 +2,7 @@ node_modules/
 host/native-host-wrapper.sh
 .env
 .env.local
+host/qa/qa-config.json
 *.log
 .DS_Store
 
