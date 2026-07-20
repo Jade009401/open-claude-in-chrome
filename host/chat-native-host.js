@@ -182,6 +182,59 @@ function emitDone(state) {
     writeNative({ type: 'assistant_done', requestId: state.requestId });
   }
 }
+// 斜杠命令输出(/cost 等):独立类型,侧栏渲染成保留换行的等宽块(不当普通 Markdown)。
+function emitCommandOutput(requestId, text, extra = {}) {
+  if (!text) return;
+  writeNative({ type: 'command_output', requestId, text, ...extra });
+}
+
+// ── 斜杠命令 / agent 能力发现 ─────────────────────────────────────
+// Claude 的 system/init 事件带 slash_commands(技能/自定义/插件命令)+ agents;
+// 侧栏斜杠菜单据此渲染。此前 init 只取了 tools,命令列表一直为空。缓存一次避免重复探。
+let cachedCapabilities = null;
+function capabilitiesFromInit(event) {
+  const slash = Array.isArray(event?.slash_commands) ? event.slash_commands : [];
+  const agents = Array.isArray(event?.agents) ? event.agents : [];
+  if (!slash.length && !agents.length) return null;
+  return {
+    type: 'capabilities',
+    capabilitiesStatus: 'loaded',
+    commands: slash.map((name) => ({ name: String(name) })),
+    agents: agents.map((name) => ({ name: String(name) })),
+  };
+}
+function emitCapabilities(event) {
+  const caps = capabilitiesFromInit(event);
+  if (!caps) return;
+  cachedCapabilities = caps;
+  writeNative(caps);
+}
+// 连上/新会话时异步探一次 claude:读到 init 就抽命令、emit、随即 kill(拿到 init 即停,
+// 几乎不产 token)。已缓存则直接复用不再 spawn;失败静默(不影响会话)。
+function probeCapabilities() {
+  if (cachedCapabilities) { writeNative(cachedCapabilities); return; }
+  let child;
+  try {
+    child = spawn(process.env.CLAUDE_SIDEBAR_CLAUDE_BIN || 'claude',
+      ['-p', '--output-format', 'stream-json', '--verbose', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'],
+      { cwd: os.tmpdir(), env: process.env, stdio: ['pipe', 'pipe', 'ignore'] });
+  } catch (error) { logHost('capabilities_probe_spawn_failed', { error: String(error) }); return; }
+  let buf = '';
+  const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 30000);
+  const stop = () => { clearTimeout(killer); try { child.kill('SIGKILL'); } catch {} };
+  child.stdout.on('data', (chunk) => {
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      if (event?.type === 'system' && event.subtype === 'init') { emitCapabilities(event); stop(); return; }
+    }
+  });
+  child.on('error', (error) => { clearTimeout(killer); logHost('capabilities_probe_error', { error: String(error) }); });
+  try { child.stdin.write('hi'); child.stdin.end(); } catch {}
+}
 function stripManagedClaudeArgs(input) {
   const result = [];
   for (let i = 0; i < input.length; i += 1) {
@@ -403,6 +456,7 @@ function parseStreamLine(state, line) {
         return;
       }
       emitStatus(state.requestId, '浏览器地图工具已加载', 'running', JSON.stringify({ server: PURE_MAP_SERVER_NAME, tools: surface.expected }));
+      emitCapabilities(event); // 顺带把 slash_commands/agents 喂给侧栏斜杠菜单
       if (state.inventoryIntent) {
         const inventory = formatPureMapToolInventory(surface);
         emitAssistantMessage(state.requestId, inventory);
@@ -419,7 +473,7 @@ function parseStreamLine(state, line) {
     const stdoutMatch = localOutput.match(/<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/);
     const stderrMatch = localOutput.match(/<local-command-stderr>([\s\S]*?)<\/local-command-stderr>/);
     const surfaced = [stdoutMatch?.[1], stderrMatch?.[1]].filter((part) => part && part.trim()).join('\n').trim();
-    if (surfaced) emitAssistantMessage(state.requestId, surfaced);
+    if (surfaced) emitCommandOutput(state.requestId, surfaced, { command: state.slashCommand || null, isError: Boolean(stderrMatch?.[1] && !stdoutMatch?.[1]) });
     return;
   }
   if (type === 'stream_event') {
@@ -603,7 +657,7 @@ function startChat(message, enqueuedAt = Date.now()) {
   // Resume must run in the same project the session was created in, else the CLI
   // cannot re-open the transcript — reuse the pinned cwd once a session exists.
   const effectiveCwd = cli.resume && cli.cliCwd ? cli.cliCwd : cwdSelection.cwd;
-  const { prompt, attachments } = buildPrompt(message, { resume: cli.resume });
+  const { prompt, attachments, slashCommand } = buildPrompt(message, { resume: cli.resume });
   const command = process.env.CLAUDE_SIDEBAR_CLAUDE_BIN || 'claude';
   const args = parseArgs(cli);
   const mcpConfig = String(process.env.CLAUDE_SIDEBAR_MCP_CONFIG || '').trim();
@@ -623,6 +677,7 @@ function startChat(message, enqueuedAt = Date.now()) {
     sessionId,
     cli,
     child,
+    slashCommand: slashCommand || null,
     buffer: '',
     stderr: '',
     lastAssistantText: '',
@@ -753,11 +808,13 @@ export async function handleIncomingMessage(rawMessage) {
     case 'new_session':
       cleanupOldAttachments();
       currentSessionId = null;
+      probeCapabilities(); // 异步拉命令列表,连上就能打 / 看到全部命令
       return legacySessionPrepared({ ...message, sessionId: normalizedSessionId({}, true) });
     case 'prepare_session':
     case 'select_session':
     case 'resume_session':
       cleanupOldAttachments();
+      probeCapabilities(); // 异步拉命令列表,连上就能打 / 看到全部命令
       return legacySessionPrepared(message);
     case 'list_sessions':
       return legacySessionsReply(message);
@@ -793,7 +850,14 @@ export async function handleIncomingMessage(rawMessage) {
           message: (text) => emitAssistantMessage(requestId, text),
           done: () => emitDone({ requestId }),
         };
-        qaSidebar.runQaInSidebar(chatText, emit); // 异步跑,进度经 emit 回显
+        // 被测目标默认 = 用户当前打开的页(chat 消息带 pageContext;回退到 host 侧上下文权威)。
+        const snap = contextAuthority.snapshot();
+        const pc = (message.pageContext && Number(message.pageContext.tabId) ? message.pageContext : null)
+          || snap?.pinnedPage || snap?.currentPage || null;
+        const pageContext = pc && Number(pc.tabId)
+          ? { tabId: Number(pc.tabId), url: String(pc.url || ''), title: String(pc.title || '') }
+          : null;
+        qaSidebar.runQaInSidebar(chatText, emit, pageContext); // 异步跑,进度经 emit 回显
         return { type: 'accepted', requestId };
       }
       const { requestId, attachmentCount } = enqueueChat(message);
