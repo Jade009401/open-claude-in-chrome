@@ -8,6 +8,8 @@ import { randomUUID } from 'node:crypto';
 import { prepareChatMessageAttachments, cleanupOldAttachments, chatAttachmentLimits } from './chat-attachment-store.mjs';
 import { createChatContextAuthority } from './chat-context-authority.mjs';
 import { PURE_MAP_CLAUDE_TOOL_NAMES, PURE_MAP_SERVER_NAME, validateClaudeToolSurface, formatPureMapToolInventory } from './mcp-tool-surface.mjs';
+// QA 侧栏命令(/qa):在 chat 层拦截,跑 host 侧编排器,不转 Claude CLI。逻辑在 host/qa/。
+import * as qaSidebar from './qa/sidebar-command.mjs';
 
 const VERSION = '0.15.3';
 const HOST_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -778,6 +780,22 @@ export async function handleIncomingMessage(rawMessage) {
     case 'context_status':
       return { type: 'context_status', version: VERSION, selection: contextAuthority.snapshot() };
     case 'chat': {
+      // QA 拦截:①人审待确认时,这条消息作为 y/n 回答;②/qa 命令 → 跑编排器,不转 Claude CLI。
+      const chatText = String(message.prompt ?? message.message ?? message.text ?? message.content ?? '');
+      if (qaSidebar.hasPending()) {
+        qaSidebar.answer(chatText);
+        return { type: 'accepted', requestId: String(message.requestId || `qa-${Date.now()}`) };
+      }
+      if (qaSidebar.isQaCommand(chatText)) {
+        const requestId = String(message.requestId || `qa-${Date.now()}`);
+        const emit = {
+          status: (label) => emitStatus(requestId, label),
+          message: (text) => emitAssistantMessage(requestId, text),
+          done: () => emitDone({ requestId }),
+        };
+        qaSidebar.runQaInSidebar(chatText, emit); // 异步跑,进度经 emit 回显
+        return { type: 'accepted', requestId };
+      }
       const { requestId, attachmentCount } = enqueueChat(message);
       return { type: 'accepted', requestId, attachmentCount, authoritativePage: contextAuthority.snapshot()?.pinnedPage || contextAuthority.snapshot()?.nextPage || null };
     }

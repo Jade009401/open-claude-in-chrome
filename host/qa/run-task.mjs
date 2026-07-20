@@ -6,17 +6,11 @@
 // 前置:被测页在 Chrome 打开、mcp-server primary 在跑(侧栏会话在,或自持)。
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
-import { createClient, readDoc, writeRunRecord, broadcast } from './lark-client.mjs';
-import { generate } from './script-gen.mjs';
-import { replayStep } from './replayer.mjs';
-import { judge, buildEvidence } from './verdict.mjs';
-import { summarize } from './report.mjs';
-import { resolveTargets } from './routing.mjs';
+import { createClient } from './lark-client.mjs';
 import { runTask } from './orchestrator.mjs';
-import * as safety from './safety.mjs';
-import { assertAppEnvGate } from './app-gate.mjs';
 import { loadQaConfig } from './config.mjs';
 import { BrowserClient } from './browser-client.mjs';
+import { buildRealDeps } from './task-deps.mjs';
 
 async function main() {
   const prdUrl = process.argv[2];
@@ -40,13 +34,9 @@ async function main() {
     await bc.map({ pageQuery: targetUrl });
   }
 
-  const deps = {
-    url: targetUrl,
-    whitelist: cfg.envWhitelist,
-    rules: cfg,
-    readDoc: (u) => readDoc(u, { client }),
-    generate: (prd) => generate(prd),
-    // 人审(A):打印脚本 + routeKey,终端确认。
+  const deps = buildRealDeps({
+    client, cfg, targetUrl, bc,
+    // 人审(A):终端打印脚本 + y/n。
     reviewScript: async (script) => {
       console.log('\n===== 待人审脚本 =====');
       console.log('routeKey:', script.routeKey);
@@ -55,25 +45,9 @@ async function main() {
       const a = await ask('确认执行? (y=确认 / n=否决): ');
       return { approved: a === 'y', script };
     },
-    // 重放:locate/read/act 走浏览器客户端;写操作终端二次确认(不自传 confirmed)。
-    replayStep: (step) => replayStep(step, {
-      url: targetUrl,
-      whitelist: cfg.envWhitelist,
-      rules: cfg,
-      safety,
-      locate: async ({ query }) => bc.locate({ query, pageQuery: targetUrl, limit: 5 }),
-      read: async (anchor) => bc.read({ id: anchor.id, pageQuery: targetUrl }),
-      act: async (anchor, s) => bc.act({ id: anchor.id, action: s.action, value: s.value, confirmed: true, pageQuery: targetUrl }),
-      confirm: async (s) => (await ask(`⚠️ 写操作 [${s.action} ${s.target}] 确认执行? (y/n): `)) === 'y',
-    }),
-    judge,
-    buildEvidence,
-    summarize,
-    assertAppEnvGate: (端) => assertAppEnvGate(端),
-    resolveTargets: (routeKey) => resolveTargets(client, routeKey),
-    writeRunRecord: (token, tableId, fields) => writeRunRecord(client, token, tableId, fields),
-    broadcast: (chatId, text) => broadcast(client, chatId, text),
-  };
+    // 写操作终端二次确认(不自传 confirmed)。
+    confirm: async (s) => (await ask(`⚠️ 写操作 [${s.action} ${s.target}] 确认执行? (y/n): `)) === 'y',
+  });
 
   try {
     const r = await runTask(prdUrl, deps);
