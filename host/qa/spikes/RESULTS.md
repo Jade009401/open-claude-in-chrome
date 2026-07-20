@@ -57,6 +57,27 @@ node host/qa/spikes/spike-lark-read.mjs "https://.../wiki/GX4PwRfomivjhjkawYnj2d
 
 **当前状态:0b 核心(独立 client 驱动 map/locate)✅ 通过;上表 3 项列为 Task 4/7 接线注意 + 后续真实被测页复测。**
 
-## Task 0c — host 拿到"PRD→脚本"生成结果(候选 B / 侧栏 Claude)
+## Task 0c — host 拿到"PRD→脚本"生成结果(候选 B′ / spawn headless claude)
 
-⏳ 未开始。
+**读代码发现:** chat-native-host 拉起侧栏 Claude 的方式就是跑 `claude -p --output-format stream-json …`(用 CLI 登录态,无 API key)。据此得到比原 B1 更干净的 **B′**:编排器**自己 spawn 一次 headless `claude -p`** 来生成脚本,不用截侧栏聊天、不加 MCP 工具(不撞工具面锁)、不依赖活跃 primary。
+
+### ✅ 通过(2026-07-20)
+
+- 命令:`claude -p --output-format json --strict-mcp-config --mcp-config '{"mcpServers":{}}'`,cwd=中性目录,PRD 走 stdin。
+- 实测:喂样例 PRD → **17s** 返回 `is_error=false` → 解析出合法脚本:`requirementIds=["R1","R2","R3"]`、5 个 steps、每个 step 的 `requirementId` 都在全集内(**覆盖率溯源成立**)。
+- 结论:**B′ 成立**——编排器 spawn headless claude 能稳定拿回结构化脚本,零 API key。Task 3 生成落点按此接线(host 里 `script-gen.mjs` = 组 prompt + spawn CLI + 解析 + `validateScript`)。
+
+### 注意 / 待办(Task 3 细化)
+
+- 生成耗时(样例 17s)计入单场景端到端耗时,与止损"耗时"指标相关。
+- cwd=tmpdir 避开了本项目 CLAUDE.md,但**用户级 `~/.claude/CLAUDE.md` + hooks 仍会加载**(本次未影响生成);生产/Task3 可加 `--settings` 进一步隔离。
+- 模型给 step[0] 补了 `navigate`(expected 空)——prompt/schema 在 Task 3 细化(动作枚举、expected 必填规则)。
+
+---
+
+# ✅ Phase 0 gating 全部通过(0a / 0b / 0c)
+
+三道 spike 均已实测通过,**下游 Task 1–7 的 gating 解除**,可进入建设:
+- 0a:飞书应用身份读知识库文档(含新建)✅
+- 0b:独立 TCP client 驱动 map/locate ✅(截图去化、map 生命周期、primary ephemeral 已记为接线注意)
+- 0c:spawn headless claude 生成脚本(B′,零 key)✅
