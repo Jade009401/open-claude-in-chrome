@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Claude Code 浏览器侧栏</title>
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="brand-row">
+          <span class="brand-dot"></span>
+          <strong>Claude Code</strong>
+        </div>
+        <div class="status-row">
+          <div id="status" class="status">正在连接本地 Claude Code…</div>
+          <button id="reconnectButton" class="status-retry" type="button" hidden>重试</button>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button id="agentsButton" class="icon-button agent-button" title="Agents" aria-label="Agents">A</button>
+        <button id="historyButton" class="icon-button" title="历史会话" aria-label="历史会话">☰</button>
+        <button id="settingsButton" class="icon-button" title="设置" aria-label="设置">⚙</button>
+        <button id="newChatButton" class="icon-button" title="新建对话" aria-label="新建对话">＋</button>
+      </div>
+    </header>
+
+    <div id="contextStack" class="context-stack">
+      <section id="pageContext" class="page-context" hidden>
+        <div class="context-kicker">CURRENT PAGE</div>
+        <div class="page-context-main">
+          <div id="pageTitle" class="page-title"></div>
+          <div id="pageUrl" class="page-url"></div>
+        </div>
+      </section>
+
+      <nav id="threadBar" class="thread-bar" aria-label="Agent Threads" hidden>
+        <button id="mainThreadButton" class="thread-tab thread-tab-main" data-thread-id="main" data-active="true">Main</button>
+        <div id="threadTabs" class="thread-tabs"></div>
+      </nav>
+    </div>
+
+    <main id="messages" class="messages" aria-live="polite">
+      <section id="emptyState" class="empty-state">
+        <div class="claude-mark">C</div>
+        <h1>和 Claude Code 讨论当前页面</h1>
+        <p>Claude Code 可以查看当前标签页、读取页面结构、截取页面截图，并结合你的本地项目上下文进行分析和修改。</p>
+        <div class="suggestions">
+          <button data-prompt="总结当前页面，并告诉我最重要的三个信息。">总结当前页面</button>
+          <button data-prompt="检查当前页面的 UI，从前端实现和用户体验角度指出明显问题。">检查页面 UI</button>
+          <button data-prompt="查看当前页面、控制台和网络请求，帮我排查明显的问题。">调试当前页面</button>
+        </div>
+      </section>
+    </main>
+
+    <section id="questionPanel" class="question-panel" hidden>
+      <div class="question-title">Claude 需要你选择方案</div>
+      <div id="questionList" class="question-list"></div>
+      <div class="question-actions">
+        <button id="submitQuestion" class="primary-button">提交选择</button>
+      </div>
+    </section>
+
+    <section id="permissionPanel" class="permission-panel" hidden>
+      <div class="permission-title">Claude 请求使用工具</div>
+      <div id="permissionTool" class="permission-tool"></div>
+      <pre id="permissionInput" class="permission-input"></pre>
+      <div class="permission-actions">
+        <button id="denyPermission" class="secondary-button">拒绝</button>
+        <button id="allowPermission" class="primary-button">本次允许</button>
+      </div>
+    </section>
+
+    <footer class="composer-wrap">
+      <div id="commandMenu" class="command-menu" hidden></div>
+      <div id="agentActivityList" class="agent-activity-list" hidden></div>
+      <div id="toolActivity" class="tool-activity" hidden></div>
+      <div id="performanceBar" class="performance-bar" hidden></div>
+      <div class="composer">
+        <textarea id="promptInput" rows="1" placeholder="问 Claude Code 关于当前页面的问题…"></textarea>
+        <button id="sendButton" class="send-button" title="发送" aria-label="发送">↑</button>
+        <button id="stopButton" class="stop-button" title="停止" aria-label="停止" hidden>■</button>
+      </div>
+      <div class="composer-meta">
+        <span id="sessionLabel">新的本地会话</span>
+        <span>↵ 发送 · 回答中可继续排队</span>
+      </div>
+    </footer>
+  </div>
+
+  <div id="agentsBackdrop" class="history-backdrop" hidden></div>
+  <aside id="agentsDrawer" class="history-drawer agent-drawer" aria-label="Claude Agents" hidden>
+    <div class="history-header">
+      <div>
+        <strong>Claude Agents</strong>
+        <div class="history-subtitle">当前 Claude Code Session 可用的 Subagents</div>
+      </div>
+      <button id="closeAgentsButton" class="icon-button" aria-label="关闭 Agents">×</button>
+    </div>
+    <div id="agentsList" class="agents-list">
+      <div class="history-loading">启动 Session 后读取 Agents…</div>
+    </div>
+  </aside>
+
+  <div id="historyBackdrop" class="history-backdrop" hidden></div>
+  <aside id="historyDrawer" class="history-drawer" aria-label="历史会话" hidden>
+    <div class="history-header">
+      <div>
+        <strong>历史会话</strong>
+        <div class="history-subtitle">直接读取 Claude Code 本地 Session</div>
+      </div>
+      <button id="closeHistoryButton" class="icon-button" aria-label="关闭历史会话">×</button>
+    </div>
+    <button id="historyNewChatButton" class="history-new-button">＋ 新建对话</button>
+    <div id="historyList" class="history-list">
+      <div class="history-loading">正在读取本地会话…</div>
+    </div>
+  </aside>
+
+  <dialog id="settingsDialog" class="settings-dialog">
+    <form method="dialog" id="settingsForm">
+      <div class="dialog-header">
+        <strong>本地 Claude Code 设置</strong>
+        <button value="cancel" class="icon-button" aria-label="关闭">×</button>
+      </div>
+      <label>
+        项目目录
+        <input id="cwdInput" type="text" placeholder="/Users/你的用户名/project" />
+      </label>
+      <div class="field-help">留空时，历史记录显示所有本地 Claude Code 会话；发送新消息默认使用用户主目录。</div>
+      <label>
+        指定模型
+        <input id="modelInput" type="text" list="modelOptions" placeholder="留空则使用 Claude Code 默认模型" />
+        <datalist id="modelOptions"></datalist>
+      </label>
+      <label>
+        权限模式
+        <select id="permissionModeInput">
+          <option value="default">默认（逐项确认）</option>
+          <option value="acceptEdits">自动接受文件编辑</option>
+          <option value="plan">仅规划模式</option>
+          <option value="auto">自动模式</option>
+        </select>
+      </label>
+      <label class="checkbox-row">
+        <input id="includePageContextInput" type="checkbox" checked />
+        自动将当前活动标签页作为“当前页面”上下文
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel" class="secondary-button">取消</button>
+        <button id="saveSettingsButton" value="default" class="primary-button">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="chat-attachments.js"></script>
+<script src="markdown-renderer.js"></script>
+    <script src="browser-interaction.js"></script>
+  <script src="sidepanel-compat-bridge.js"></script>
+  <script src="sidepanel-entry-takeover.js"></script>
+<script src="sidepanel.js"></script>
+</body>
+</html>
