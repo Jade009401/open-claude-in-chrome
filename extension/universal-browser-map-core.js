@@ -22,8 +22,10 @@ function escapeLocatorValue(value) {
 
 function extractLeadingNumber(text) {
   // Three shapes: "（25）标题"/"(25) 标题"; "25）标题"/"25) 标题"; "25. 标题"/"25、"/"第25条".
-  // Paren-closed forms need no trailing separator; the bare form still does.
-  const match = normalizeText(text).match(/^(?:[（(]\s*(\d{1,5})\s*[)）]|(\d{1,5})\s*[)）]|(?:第\s*)?(\d{1,5})(?:\s*条)?(?:[.、:：\s-]+|$))/);
+  // Paren-closed forms need no trailing separator; the bare form still does. The bare form
+  // excludes times ("16:03:39" — ":" is not an ordinal separator) and decimals/thousands
+  // ("20.070"/"2,000" — a digit followed by [.,]digit is a value, not an ordinal).
+  const match = normalizeText(text).match(/^(?:[（(]\s*(\d{1,5})\s*[)）]|(\d{1,5})\s*[)）]|(?:第\s*)?(\d{1,5})(?![.,]\d)(?:\s*条)?(?:[.、\s-]+|$))/);
   return match ? Number(match[1] ?? match[2] ?? match[3]) : null;
 }
 
