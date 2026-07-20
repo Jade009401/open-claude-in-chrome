@@ -113,6 +113,27 @@ test('prepareTarget 抛白名单错(建图前) → 停在 prepare,不重放', as
   assert.ok(!deps.calls.includes('replayStep'), '建图失败不该重放');
 });
 
+test('路由无匹配行 → 自动创建(autoCreated),无群跳过播报', async () => {
+  const deps = makeDeps({
+    resolveTargets: async () => { deps.calls.push('resolveTargets'); return { ok: true, autoCreated: true, resultToken: 'AT', resultTableId: 'TID', chatId: null, resultTableUrl: 'u', routingUrl: 'ru' }; },
+  });
+  const r = await runTask('prd-url', deps);
+  assert.equal(r.ok, true);
+  assert.equal(r.routed, true);
+  assert.equal(r.autoCreated, true);
+  assert.equal(r.broadcasted, false);
+  assert.ok(!deps.calls.includes('broadcast'), '无群不播报');
+});
+
+test('路由/写库失败 → 降级返回结果(routed:false,不作废)', async () => {
+  const deps = makeDeps({ resolveTargets: async () => { throw new Error('boom'); } });
+  const r = await runTask('prd-url', deps);
+  assert.equal(r.ok, true, '降级仍算 ok');
+  assert.equal(r.routed, false);
+  assert.ok(Array.isArray(r.stepResults) && r.stepResults.length >= 1, '结果照返回');
+  assert.match(String(r.routingError || ''), /boom/);
+});
+
 test('人审否决 → 不重放、不写表', async () => {
   const deps = makeDeps({ reviewScript: async () => { return { approved: false }; } });
   const r = await runTask('prd-url', deps);

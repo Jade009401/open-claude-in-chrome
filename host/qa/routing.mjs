@@ -1,6 +1,6 @@
 // 结果路由(设计 §11.5:AI 自管知识空间 + 播报文档地址实现透明)。
 // 路由总表/结果表由应用自建自拥;应用在自己空间按名字找路由总表,零本地配置、不碰共享知识库。
-import { createClient } from './lark-client.mjs';
+import { createClient, ensureSharedResultTable, addRoutingRow, firstTableId } from './lark-client.mjs';
 
 const ROUTING_BASE_NAME = 'QA路由总表';
 
@@ -60,17 +60,36 @@ async function resolveGroupChatId(client, groupName) {
 }
 
 // 便捷:按 routeKey 解析出完整落点(结果表 token/tableId + 群 chat_id + 各文档 URL)。
+// 无匹配行 → 自动创建:共享结果表(缺则建)+ 往路由总表加行(群名空);播报群留空 → chatId=null(跳过播报)。
 async function resolveTargets(client, routeKey) {
   const base = await findRoutingBase(client);
   const routes = await readRoutes(client, base.appToken);
   const route = resolveRoute(routes, routeKey);
-  if (!route.ok) return { ok: false, reason: route.reason, routingUrl: base.url };
+  if (!route.ok) {
+    const shared = await ensureSharedResultTable(client);
+    const idx = String(routeKey || '').indexOf('-');
+    const 端 = idx >= 0 ? routeKey.slice(0, idx) : String(routeKey || '');
+    const mod = idx >= 0 ? routeKey.slice(idx + 1) : '';
+    const routingTableId = await firstTableId(client, base.appToken);
+    await addRoutingRow(client, base.appToken, routingTableId, { 端, 系统模块: mod, 结果表链接: shared.url, 播报群名: '' });
+    return {
+      ok: true,
+      autoCreated: true,
+      routingUrl: base.url,
+      resultTableUrl: shared.url,
+      resultToken: shared.appToken,
+      resultTableId: shared.tableId,
+      groupName: '',
+      chatId: null,
+    };
+  }
   const resultToken = baseTokenFromUrl(route.resultTableUrl);
   const tl = await client.bitable.v1.appTable.list({ path: { app_token: resultToken }, params: { page_size: 20 } });
   const resultTableId = tl.data?.items?.[0]?.table_id;
   const chatId = await resolveGroupChatId(client, route.groupName);
   return {
     ok: true,
+    autoCreated: false,
     routingUrl: base.url,
     resultTableUrl: route.resultTableUrl,
     resultToken,

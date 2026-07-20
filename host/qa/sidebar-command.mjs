@@ -10,6 +10,7 @@ import { loadQaConfig } from './config.mjs';
 import { BrowserClient } from './browser-client.mjs';
 import { runTask } from './orchestrator.mjs';
 import { buildRealDeps } from './task-deps.mjs';
+import { formatRunResult } from './report.mjs';
 import * as systemsMemory from './systems-memory.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -146,9 +147,9 @@ async function runQaInSidebar(text, emit, pageContext = null) {
     });
     emit.status('QA:读需求 + 生成脚本…');
     const r = await runTask(prdUrl, deps);
-    emit.message(r.ok
-      ? `✅ 完成 ${r.routeKey}｜通过 ${r.summary?.pass}/失败 ${r.summary?.fail}/不确定 ${r.summary?.uncertain}｜耗时 ${r.durationMs}ms｜已写结果表 + 播报群`
-      : `⛔ 没跑完(${stageLabel(r.stage)}):${humanizeError(r)}`);
+    // 跑完(含路由降级)→ 结果块直接显示;真失败(生成/人审/建图/重放阶段)→ 人话报错。
+    if (r.ok) emit.message(`\`\`\`\n${formatRunResult(r)}\n\`\`\``);
+    else emit.message(`⛔ 没跑完(${stageLabel(r.stage)}):${humanizeError(r)}`);
   } catch (e) {
     emit.message(`QA 异常:${e?.message || e}`);
   } finally {

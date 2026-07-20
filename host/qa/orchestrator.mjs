@@ -113,28 +113,50 @@ async function runTask(prdInput, deps = {}) {
     : { total: judgedList.length };
   const durationMs = Date.now() - t0;
 
-  // 8. 按 routeKey 路由到结果表 + 群
-  const targets = await deps.resolveTargets(routeKey);
-  if (!targets?.ok) return fail(targets?.reason || '路由解析失败', { stage: 'routing', summary });
+  // 8-9. 路由 + 写结果表 + 播报。
+  //   缺路由行 → resolveTargets 自动建共享结果表 + 加路由行;有播报群才播报。
+  //   任何飞书写失败(路由/建表/写库/播报)→ 降级:结果照返回(routed:false),绝不作废。
+  const verdict = summary.pass && !summary.fail && !summary.uncertain ? '通过' : (summary.fail ? '失败' : '不确定');
+  let targets = null;
+  let recordId = null;
+  let messageId = null;
+  try {
+    targets = await deps.resolveTargets(routeKey);
+    recordId = await deps.writeRunRecord(targets.resultToken, targets.resultTableId, {
+      系统: routeKey,
+      用例: script.caseName || prdInput,
+      AI判定: verdict,
+      耗时ms: String(durationMs),
+      证据链接: targets.resultTableUrl,
+      人工改判: '',
+      脚本改动: review.edited ? '有' : '',
+    });
+    if (targets.chatId) {
+      const text = [
+        `【QA 结果播报】${routeKey}`,
+        `通过 ${summary.pass ?? '?'} / 失败 ${summary.fail ?? '?'} / 不确定 ${summary.uncertain ?? '?'}｜覆盖率 ${summary.coverage ?? ''}｜耗时 ${durationMs}ms`,
+        `结果表: ${targets.resultTableUrl}`,
+        `路由总表: ${targets.routingUrl}`,
+      ].join('\n');
+      messageId = await deps.broadcast(targets.chatId, text);
+    }
+  } catch (e) {
+    return { ok: true, routed: false, routeKey, summary, durationMs, stepResults, routingError: String(e?.message || e), resultTableUrl: targets?.resultTableUrl || null };
+  }
 
-  // 9. 写结果表(一条运行记录)+ 播报(含文档 URL = 透明)
-  const recordId = await deps.writeRunRecord(targets.resultToken, targets.resultTableId, {
-    用例: script.caseName || prdInput,
-    AI判定: summary.pass && !summary.fail && !summary.uncertain ? '通过' : (summary.fail ? '失败' : '不确定'),
-    耗时ms: String(durationMs),
-    证据链接: targets.resultTableUrl,
-    人工改判: '',
-    脚本改动: review.edited ? '有' : '',
-  });
-  const text = [
-    `【QA 结果播报】${routeKey}`,
-    `通过 ${summary.pass ?? '?'} / 失败 ${summary.fail ?? '?'} / 不确定 ${summary.uncertain ?? '?'}｜覆盖率 ${summary.coverage ?? ''}｜耗时 ${durationMs}ms`,
-    `结果表: ${targets.resultTableUrl}`,
-    `路由总表: ${targets.routingUrl}`,
-  ].join('\n');
-  const messageId = await deps.broadcast(targets.chatId, text);
-
-  return { ok: true, routeKey, summary, durationMs, recordId, messageId, stepResults };
+  return {
+    ok: true,
+    routed: true,
+    autoCreated: targets.autoCreated === true,
+    broadcasted: Boolean(messageId),
+    routeKey,
+    summary,
+    durationMs,
+    recordId,
+    messageId,
+    resultTableUrl: targets.resultTableUrl,
+    stepResults,
+  };
 }
 
 export { runTask };

@@ -12,6 +12,7 @@ import { loadQaConfig } from './config.mjs';
 import { BrowserClient } from './browser-client.mjs';
 import { buildRealDeps } from './task-deps.mjs';
 import { stageLabel, humanizeError } from './sidebar-command.mjs';
+import { formatRunResult } from './report.mjs';
 
 async function main() {
   const prdUrl = process.argv[2];
@@ -58,7 +59,7 @@ async function main() {
     const r = await runTask(prdUrl, deps);
     console.log('\n===== 结果 =====');
     if (r.ok) {
-      console.log(JSON.stringify({ ok: r.ok, routeKey: r.routeKey, summary: r.summary, durationMs: r.durationMs, recordId: r.recordId, messageId: r.messageId }, null, 2));
+      console.log(formatRunResult(r));
     } else {
       console.log(`⛔ 没跑完(${stageLabel(r.stage)}):${humanizeError(r)}`);
     }

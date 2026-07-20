@@ -61,4 +61,26 @@ function computeStopMetrics(baseRows = []) {
   };
 }
 
-export { summarize, computeStopMetrics, normVerdict, isOverturned };
+// 把一次运行结果格式化成可读文本块(侧栏/终端展示,让用户直接看到结果)。r = runTask 返回。
+function formatRunResult(r = {}) {
+  const s = r.summary || {};
+  const label = { pass: '✅通过', fail: '❌失败', uncertain: '❓不确定' };
+  const lines = [
+    `QA 结果 ${r.routeKey || ''}｜✅${s.pass ?? 0} / ❌${s.fail ?? 0} / ❓${s.uncertain ?? 0}｜覆盖 ${s.coverage ?? ''}｜耗时 ${r.durationMs ?? '?'}ms`,
+  ];
+  (r.stepResults || []).forEach((x, i) => {
+    const j = x?.judged || {};
+    const v = label[normVerdict(j.verdict)] || j.verdict || '?';
+    const detail = normVerdict(j.verdict) === 'pass' ? '' : ` 期望=${x?.step?.expected ?? ''} 实际=${j.actual ?? j.reason ?? ''}`;
+    lines.push(`  ${i + 1}. ${v} [${x?.step?.action ?? ''}] ${x?.step?.target ?? ''}${detail}`);
+  });
+  if (r.routed === false) {
+    lines.push(`⚠️ 未写飞书(${r.routingError || '路由/写库失败'});以上为本地结果`);
+  } else if (r.routed) {
+    lines.push(`已写「QA结果表」: ${r.resultTableUrl || ''}${r.autoCreated ? '(路由总表没这系统,已自动加行)' : ''}`);
+    lines.push(r.broadcasted ? '已播报到群' : '未配播报群 → 跳过播报(在路由行填「播报群名」后自动播报)');
+  }
+  return lines.join('\n');
+}
+
+export { summarize, computeStopMetrics, normVerdict, isOverturned, formatRunResult };

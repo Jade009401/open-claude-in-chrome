@@ -18,8 +18,8 @@ function buildPrompt(prd, { refs, routeKeys } = {}) {
     : '';
   const keyList = Array.isArray(routeKeys) ? routeKeys.filter(Boolean) : [];
   const routeNote = keyList.length
-    ? `\nrouteKey 从以下已有路由键里选最匹配的一个:${JSON.stringify(keyList)};都不匹配就填 "待人工"。`
-    : `\nrouteKey 按「端-系统模块」格式填(如 "运营后台-VIP");拿不准就填 "待人工"。`;
+    ? `\nrouteKey 从以下已有路由键里选最匹配的一个:${JSON.stringify(keyList)};都不匹配就按「端-系统模块」格式**新拟一个**(如 "运营后台-VIP配置"),不要填 "待人工"。`
+    : `\nrouteKey 按「端-系统模块」格式填(如 "运营后台-VIP配置"),从 PRD 推断被测端与模块,不要填 "待人工"。`;
   return `你是测试脚本生成器。根据下面的 PRD,产出一个 JSON 描述只读断言步骤序列。
 只输出 JSON,不要任何解释、不要 markdown 围栏、不要调用任何工具。
 结构:

@@ -152,6 +152,38 @@ async function listRunRecords(client, appToken, tableId) {
   return rr.data?.items || [];
 }
 
+// —— 自动创建:共享结果表 + 路由行(路由总表没匹配行时用)——
+const SHARED_RESULT_TABLE_NAME = 'QA结果表';
+const RESULT_FIELDS = ['系统', '用例', 'AI判定', '耗时ms', '证据链接', '人工改判', '脚本改动'];
+
+// 找应用空间里的「QA结果表」bitable;没有就建一张(补齐所需字段)。返回 { appToken, tableId, url, created }。
+async function ensureSharedResultTable(client) {
+  const list = await client.drive.v1.file.list({ params: { page_size: 100 } });
+  const found = (list.data?.files || []).find((f) => f.name === SHARED_RESULT_TABLE_NAME && f.type === 'bitable');
+  if (found) {
+    return { appToken: found.token, tableId: await firstTableId(client, found.token), url: found.url, created: false };
+  }
+  const created = await client.bitable.v1.app.create({ data: { name: SHARED_RESULT_TABLE_NAME } });
+  if (created.code) throw new Error(`创建结果表失败 code=${created.code} msg=${created.msg}`);
+  const appToken = created.data?.app?.app_token;
+  const url = created.data?.app?.url || `base/${appToken}`;
+  const tableId = await firstTableId(client, appToken);
+  // 补齐所需字段(默认主字段保留;逐个建,已存在报错则忽略)。type:1 = 文本。
+  for (const name of RESULT_FIELDS) {
+    try {
+      await client.bitable.v1.appTableField.create({ path: { app_token: appToken, table_id: tableId }, data: { field_name: name, type: 1 } });
+    } catch { /* 字段已存在等 → 忽略 */ }
+  }
+  return { appToken, tableId, url, created: true };
+}
+
+// 往路由总表加一行。fields = { 端, 系统模块, 结果表链接, 播报群名 }。
+async function addRoutingRow(client, appToken, tableId, fields) {
+  const r = await client.bitable.v1.appTableRecord.create({ path: { app_token: appToken, table_id: tableId }, data: { fields } });
+  if (r.code) throw new Error(`加路由行失败 code=${r.code} msg=${r.msg}`);
+  return r.data?.record?.record_id;
+}
+
 // 播报到群(纯文本)。Phase 0:每次运行一张汇总卡 + 涉及文档 URL(透明审计流)。
 async function broadcast(client, chatId, text) {
   const r = await client.im.v1.message.create({
@@ -173,4 +205,7 @@ export {
   writeRunRecord,
   listRunRecords,
   broadcast,
+  ensureSharedResultTable,
+  addRoutingRow,
+  SHARED_RESULT_TABLE_NAME,
 };

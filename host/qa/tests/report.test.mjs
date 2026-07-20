@@ -1,7 +1,32 @@
 // Task 6 测试:汇总 summarize + 止损指标 computeStopMetrics(纯函数)。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarize, computeStopMetrics } from '../report.mjs';
+import { summarize, computeStopMetrics, formatRunResult } from '../report.mjs';
+
+// —— formatRunResult:结果块(每步三态 + 落库/降级状态)——
+const RUN = {
+  routeKey: '运营后台-VIP配置',
+  summary: { pass: 1, fail: 0, uncertain: 1, coverage: '2/2' },
+  durationMs: 1234,
+  stepResults: [
+    { step: { action: 'assert_text', target: '标题', expected: '登录' }, judged: { verdict: 'pass', actual: '登录' } },
+    { step: { action: 'read', target: '费率' }, judged: { verdict: 'uncertain', reason: 'anchor_not_found' } },
+  ],
+};
+
+test('formatRunResult:自动建行 → 显示已写共享表 + 自动加行', () => {
+  const out = formatRunResult({ ...RUN, routed: true, autoCreated: true, broadcasted: false, resultTableUrl: 'https://x/base/Q' });
+  assert.match(out, /✅1 .* ❌0 .* ❓1/);
+  assert.match(out, /自动加行/);
+  assert.match(out, /跳过播报/);
+  assert.match(out, /anchor_not_found/, '不确定步显示原因');
+});
+
+test('formatRunResult:降级(未写飞书)照显结果 + 原因', () => {
+  const out = formatRunResult({ ...RUN, routed: false, routingError: 'boom' });
+  assert.match(out, /未写飞书/);
+  assert.match(out, /boom/);
+});
 
 // —— summarize:统计三态 + 覆盖率 M/N ——
 test('summarize:统计过/败/不确定 + 覆盖率', () => {
