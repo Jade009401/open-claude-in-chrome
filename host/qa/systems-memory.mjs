@@ -38,13 +38,14 @@ function lookup(routeKey, featureMenu) {
   return hit && hit.url ? hit : null;
 }
 
-// 首次沉淀:记 (routeKey, 功能菜单) → url。已有记录不覆盖(保留首次)。返回是否写入。
-function record(routeKey, featureMenu, url, note) {
+// 沉淀:记 (routeKey, 功能菜单) → url。默认不覆盖已有(保留首次);
+// force=true 时覆盖(用户显式给深链纠正错入口)。返回是否写入。
+function record(routeKey, featureMenu, url, note, { force = false } = {}) {
   const key = String(featureMenu || '').trim();
   if (!routeKey || !key || !url) return false;
   const data = load();
   data[routeKey] = data[routeKey] || {};
-  if (data[routeKey][key]?.url) return false; // 已有,不覆盖
+  if (!force && data[routeKey][key]?.url) return false; // 非强制:已有不覆盖
   data[routeKey][key] = { url: String(url), note: String(note || ''), capturedAt: new Date().toISOString() };
   save(data);
   return true;

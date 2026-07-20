@@ -12,11 +12,11 @@ function makeDeps(over = {}) {
     calls,
     readDoc: async () => { calls.push('readDoc'); return { content: 'PRD正文', refs: { links: [], mentions: [] }, hasTable: false }; },
     listRouteKeys: async () => { calls.push('listRouteKeys'); return ['用户端-理财']; },
-    generate: async (prd, opts) => { calls.push('generate'); calls.lastGenOpts = opts; return { ok: true, script: { requirementIds: ['R1'], routeKey: '用户端-理财', featureMenu: '理财 > 首页', entryUrl: 'https://www-local.biconomy.vip/finance', steps: [{ action: 'assert_text', target: '标题', expected: '登录', requirementId: 'R1' }] } }; },
+    generate: async (prd, opts) => { calls.push('generate'); calls.lastGenOpts = opts; return { ok: true, script: { requirementIds: ['R1'], routeKey: '用户端-理财', featureMenu: '理财 > 首页', steps: [{ action: 'assert_text', target: '标题', expected: '登录', requirementId: 'R1' }] } }; },
     reviewScript: async (script) => { calls.push('reviewScript'); return { approved: true, script }; },
     pinnedTab: { tabId: 42, url: 'https://www-local.biconomy.vip/finance' },
     lookupSystem: () => null, // 默认未命中(首次)
-    recordSystem: (rk, fm, url) => { calls.push('recordSystem'); calls.lastRecord = { rk, fm, url }; return true; },
+    recordSystem: (rk, fm, url, opts) => { calls.push('recordSystem'); calls.lastRecord = { rk, fm, url, force: opts?.force }; return true; },
     prepareTarget: async (target) => { calls.push('prepareTarget'); calls.lastTarget = target; },
     replayStep: async (step) => { calls.push('replayStep'); return { status: 'executed', actual: '登录', step }; },
     judge: (step, r) => { calls.push('judge'); return { verdict: 'pass', requirementId: step.requirementId, actual: r.actual }; },
@@ -73,12 +73,35 @@ test('记忆命中 → 自动导航到记录 URL,不再沉淀', async () => {
   assert.ok(!deps.calls.includes('recordSystem'), '命中不再沉淀');
 });
 
-test('固定 tab 优先于 PRD entryUrl(首次未命中时)', async () => {
+test('PRD entryUrl 优先于当前页 → 导航过去(不测当前页 /home 类)', async () => {
   const deps = makeDeps({
-    generate: async () => ({ ok: true, script: { requirementIds: ['R1'], routeKey: '用户端-理财', featureMenu: 'f', entryUrl: 'https://other.example/x', steps: [{ action: 'assert_text', target: 't', expected: 'x', requirementId: 'R1' }] } }),
+    generate: async () => ({ ok: true, script: { requirementIds: ['R1'], routeKey: '用户端-理财', featureMenu: 'f', entryUrl: 'https://www-local.biconomy.vip/deep', steps: [{ action: 'assert_text', target: 't', expected: 'x', requirementId: 'R1' }] } }),
   });
   await runTask('prd-url', deps);
-  assert.equal(deps.calls.lastTarget?.tabId, 42, '有固定 tab 时忽略 script.entryUrl');
+  assert.equal(deps.calls.lastTarget?.url, 'https://www-local.biconomy.vip/deep', '有 entryUrl 就导航过去');
+  assert.equal(deps.calls.lastTarget?.navigate, true);
+});
+
+test('手输 override 优先于记忆/当前页,force 沉淀', async () => {
+  const deps = makeDeps({
+    entryUrlOverride: 'https://www-local.biconomy.vip/manual',
+    lookupSystem: () => ({ url: 'https://mem/old' }),
+  });
+  await runTask('prd-url', deps);
+  assert.equal(deps.calls.lastTarget?.url, 'https://www-local.biconomy.vip/manual', '手输压过记忆');
+  assert.equal(deps.calls.lastRecord?.url, 'https://www-local.biconomy.vip/manual');
+  assert.equal(deps.calls.lastRecord?.force, true, '显式深链 force 覆盖沉淀');
+});
+
+test('人审粘深链 → 最高优先(压过记忆/手输)+ force 沉淀', async () => {
+  const deps = makeDeps({
+    reviewScript: async (script) => { deps.calls.push('reviewScript'); return { approved: true, script, overrideUrl: 'https://www-local.biconomy.vip/pasted' }; },
+    entryUrlOverride: 'https://arg/x',
+    lookupSystem: () => ({ url: 'https://mem/old' }),
+  });
+  await runTask('prd-url', deps);
+  assert.equal(deps.calls.lastTarget?.url, 'https://www-local.biconomy.vip/pasted', '人审粘的最高优先');
+  assert.equal(deps.calls.lastRecord?.force, true);
 });
 
 test('无 tab / 无 URL / 无 entryUrl → 停在 entry(no_target)', async () => {

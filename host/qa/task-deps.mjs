@@ -53,7 +53,7 @@ function buildRealDeps({ client, cfg, connectBrowser, pinnedTab, entryUrlOverrid
     onLoginRequired, // 落到登录页时暂停(触发层实现:提示用户登录后继续)
     // 访问录读写(项目记忆):查已记入口 / 首次沉淀。
     lookupSystem: (routeKey, featureMenu) => systemsMemory.lookup(routeKey, featureMenu),
-    recordSystem: (routeKey, featureMenu, url) => systemsMemory.record(routeKey, featureMenu, url),
+    recordSystem: (routeKey, featureMenu, url, opts) => systemsMemory.record(routeKey, featureMenu, url, undefined, opts),
     // 定目标后建图。命中记忆(navigate=true)先把 tab 导到记录 URL(复用会话)再建图。
     // 导航后读重定向后的真实 URL:像登录页且 pauseOnLogin → 先不建图,返回 {isLogin:true} 让编排器暂停等登录。
     // url 过白名单(白名单外/非法 → 抛错停)。有 tabId → 固定 tab;否则按 url(pageQuery)。

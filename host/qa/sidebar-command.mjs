@@ -67,7 +67,7 @@ function answer(text) {
   if (!pendingConfirm) return false;
   const r = pendingConfirm;
   pendingConfirm = null;
-  r(String(text || '').trim().toLowerCase());
+  r(String(text || '').trim()); // 不小写:人审可能粘深链 URL,大小写敏感
   return true;
 }
 function awaitReply() { return new Promise((resolve) => { pendingConfirm = resolve; }); }
@@ -102,9 +102,11 @@ async function runQaInSidebar(text, emit, pageContext = null) {
   const describeTarget = (script) => {
     const fm = script.featureMenu || '';
     const hit = systemsMemory.lookup(script.routeKey, fm);
+    if (targetUrl) return `手输深链 → 自动导航 ${targetUrl}(会记住)`;
     if (hit?.url) return `记忆命中「${fm}」→ 自动导航 ${hit.url}`;
-    if (pinnedTab) return `首次「${fm || '(无功能菜单)'}」→ 测当前页 ${pinnedTab.url || `tab#${pinnedTab.tabId}`}${fm && pinnedTab.url ? '(跑完记住入口)' : ''}`;
-    return targetUrl || '(无当前页/URL,将中止)';
+    if (script.entryUrl) return `PRD 入口 → 自动导航 ${script.entryUrl}(会记住)`;
+    if (pinnedTab) return `⚠️ 无深链,默认测当前页 ${pinnedTab.url || `tab#${pinnedTab.tabId}`} —— 若这不是被测功能页,回复功能页深链 URL 纠正(会记住)`;
+    return '(无当前页/URL,将中止)';
   };
   let primaryChild = null;
   let deps = null;
@@ -131,14 +133,15 @@ async function runQaInSidebar(text, emit, pageContext = null) {
           `需求: ${JSON.stringify(script.requirementIds)}`,
         ];
         (script.steps || []).forEach((s, i) => lines.push(`  ${i + 1}. [${s.action}] ${s.target} 期望=${s.expected} (${s.requirementId})`));
-        lines.push('回复 y 确认执行 / n 否决');
+        lines.push('回复 y 确认执行 / n 否决 / 或粘功能页深链 URL(用它替代上面目标,并记住)');
         emit.message(lines.join('\n'));
         const a = await awaitReply();
-        return { approved: a === 'y', script };
+        if (/^https?:\/\//i.test(a)) return { approved: true, script, overrideUrl: a.trim() };
+        return { approved: a.toLowerCase() === 'y', script };
       },
       confirm: async (s) => {
         emit.message(`⚠️ 写操作 [${s.action} ${s.target}] 回复 y 确认 / n 跳过`);
-        return (await awaitReply()) === 'y';
+        return (await awaitReply()).toLowerCase() === 'y';
       },
       onLoginRequired: async (url) => {
         emit.message(`🔐 检测到登录页(会话可能过期):${url}\n请在浏览器登录后回复 ok 继续。`);

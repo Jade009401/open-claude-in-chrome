@@ -55,19 +55,29 @@ async function runTask(prdInput, deps = {}) {
   //   命中记忆 → 自动导航当前 tab 到记录 URL(复用登录会话);
   //   首次未命中 → 用当前打开的页当入口,重放跑完后沉淀 (routeKey,featureMenu)->当前URL;
   //   无当前页 → 手输 URL / PRD entryUrl 兜底;都没有 → 停(no_target)。
+  //   优先级:人审粘的深链 > 手输深链(arg) > 记忆命中 > PRD entryUrl > 当前页。
+  //   用户显式给的深链(人审粘/arg)force 覆盖沉淀(纠正错入口);PRD/当前页 是猜测,不覆盖已有。
+  //   当前页(如 /home)常常不是功能页 → 排最后,且人审已提示可粘深链纠正。
   const featureMenu = script.featureMenu || '';
+  const navTabId = deps.pinnedTab?.tabId || null;
   const remembered = deps.lookupSystem ? deps.lookupSystem(routeKey, featureMenu) : null;
   let target = null;
-  let sediment = null; // 跑完要沉淀的 { routeKey, featureMenu, url }
-  if (remembered?.url) {
-    target = { tabId: deps.pinnedTab?.tabId || null, url: remembered.url, navigate: true, source: 'memory' };
+  let sediment = null; // { routeKey, featureMenu, url, force }
+  const sink = (url, force) => { if (featureMenu && url) sediment = { routeKey, featureMenu, url, force }; };
+  if (review.overrideUrl) {
+    target = { tabId: navTabId, url: review.overrideUrl, navigate: true, source: 'review_url' };
+    sink(review.overrideUrl, true);
+  } else if (deps.entryUrlOverride) {
+    target = { tabId: navTabId, url: deps.entryUrlOverride, navigate: true, source: 'override' };
+    sink(deps.entryUrlOverride, true);
+  } else if (remembered?.url) {
+    target = { tabId: navTabId, url: remembered.url, navigate: true, source: 'memory' };
+  } else if (script.entryUrl) {
+    target = { tabId: navTabId, url: script.entryUrl, navigate: true, source: 'prd_entry_url' };
+    sink(script.entryUrl, false);
   } else if (deps.pinnedTab?.tabId) {
     target = { tabId: deps.pinnedTab.tabId, url: deps.pinnedTab.url || '', navigate: false, source: 'current_tab' };
-    if (featureMenu && deps.pinnedTab.url) sediment = { routeKey, featureMenu, url: deps.pinnedTab.url };
-  } else if (deps.entryUrlOverride) {
-    target = { url: deps.entryUrlOverride, navigate: true, source: 'override' };
-  } else if (script.entryUrl) {
-    target = { url: script.entryUrl, navigate: true, source: 'prd_entry_url' };
+    sink(deps.pinnedTab.url, false);
   }
   if (!target || (!target.tabId && !target.url)) return fail('no_target', { stage: 'entry' });
   // 建图(懒起浏览器 + 命中记忆则先导航 + 白名单校验)。白名单外/非法 URL 在此抛错停下。
@@ -101,9 +111,10 @@ async function runTask(prdInput, deps = {}) {
     return fail(e, { stage: 'replay' });
   }
 
-  // 6.5 首次沉淀:重放跑完(不管三态)→ 把这个功能菜单的入口记进访问录,下次自动导航。
+  // 6.5 沉淀:重放跑完(不管三态)→ 把这个功能菜单的入口记进访问录,下次自动导航。
+  //     用户显式深链 force 覆盖(纠正错入口);PRD/当前页猜测不覆盖已有。
   if (sediment && deps.recordSystem) {
-    try { deps.recordSystem(sediment.routeKey, sediment.featureMenu, sediment.url); } catch {}
+    try { deps.recordSystem(sediment.routeKey, sediment.featureMenu, sediment.url, { force: sediment.force === true }); } catch {}
   }
 
   // 7. 汇总
