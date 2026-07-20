@@ -34,7 +34,28 @@ node host/qa/spikes/spike-lark-read.mjs "https://.../wiki/GX4PwRfomivjhjkawYnj2d
 
 ## Task 0b — 编排器驱动 map/locate/act
 
-⏳ 未开始。
+**环境:** 我自持 primary(`node host/mcp-server.js`,stdin 走 FIFO 保活)+ 已运行的 native-host + extension;spike 作为独立 TCP client 连 18765。目标页=已打开的 Lark 文档「产品实施说明」。
+
+### ✅ 通过(2026-07-20)—— 独立 client 驱动成立
+
+- **接线形态(答 D11):** 编排器作为**独立 TCP client** 连 `127.0.0.1:18765` → `client_hello` → `client_ack(compatible=true)` → 发 `tool_request` 驱动四工具,响应按 `c<id>_` 前缀路由回。**无需同进程、无需新起 MCP 逻辑**,复用现有 primary + native-host + extension。代码依据 `mcp-server.js` `attachClient`(:286)/`handleNativeMessage`(:223)。
+- **活体证据:** `browser_map ok=true`(Lark 页 tabId=830205078,318 blocks);`browser_locate` 多查询均返回 5 个真实锚点(带 `locator`/`title`/`role=heading`/`score`),如 `服务范围→document:section[title="二、服务范围"]`。
+- **MCP 结果形态:** 工具结果是 `{content:[{type:'text', text:'<json>'}]}`,payload 在 `text` 里,须 `JSON.parse` 解开(spike 已处理;编排器接线需注意)。
+
+### 关键发现 / 待办
+
+1. **⚠️ primary 是 ephemeral 的:** 侧栏的 mcp-server 只在 Claude CLI 那一轮活跃时短暂存在,turn 结束即退(实测 18765 时有时无)。→ **编排器不能假设"侧栏 primary 常驻"**;要么编排器自持/拉起 primary(本 spike 用法),要么在 0c-B 触发时确保会话活跃。Task 4/7 接线以此为准。
+2. **locate import 形态(答 0b Step2):** `import { locateInMap }`(纯函数)与 `new MapEngine().locate`(实例方法)都可用;**推荐直接 import `locateInMap`**(不构造 MapStore/BuildLock)。
+3. **截图:** 四工具无截图原语;编排器自走 CDP 会与 extension 的 `chrome.debugger` 抢(一 tab 一 debugger)。→ **Phase 0 证据去截图化**(DOM 读回)。[代码确认,未活体测]
+4. **map 生命周期:** `browser_locate/read/act` 从不建图;导航后必须重新 `browser_map`。[schema+代码确认]
+
+### 未活体验证(诚实标注)
+
+- **多 client 与"活跃侧栏会话"并存:** 本 spike 自持 primary 时侧栏无活跃会话,故"编排器 + 真实侧栏 client 同时"未同时在线实测(代码 `clientSockets` 支持多 client)。
+- **CDP 横幅:** 目标是 Lark 文档,走 Lark 服务worker 读取路径(`lark_service_worker_cache_hit`),未必触发 chrome.debugger 横幅;**真实被测 web-app 页(非 Lark)的 CDP 横幅/act 行为需另测**。
+- **待人工确认:** 运行期间 Chrome 是否弹自动化横幅、侧栏是否被挤断。
+
+**当前状态:0b 核心(独立 client 驱动 map/locate)✅ 通过;上表 3 项列为 Task 4/7 接线注意 + 后续真实被测页复测。**
 
 ## Task 0c — host 拿到"PRD→脚本"生成结果(候选 B / 侧栏 Claude)
 
