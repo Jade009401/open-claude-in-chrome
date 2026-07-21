@@ -10,6 +10,8 @@ import { createChatContextAuthority } from './chat-context-authority.mjs';
 import { PURE_MAP_CLAUDE_TOOL_NAMES, PURE_MAP_SERVER_NAME, validateClaudeToolSurface, formatPureMapToolInventory } from './mcp-tool-surface.mjs';
 // QA 侧栏命令(/qa):在 chat 层拦截,跑 host 侧编排器,不转 Claude CLI。逻辑在 host/qa/。
 import * as qaSidebar from './qa/sidebar-command.mjs';
+// Figma 侧栏命令(/figma):抓当前 Figma tab 选中屏 → 读设计 → 生成前端提示词。逻辑在 host/figma/。
+import * as figmaSidebar from './figma/sidebar-command.mjs';
 
 const VERSION = '0.15.3';
 const HOST_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -843,6 +845,13 @@ export async function handleIncomingMessage(rawMessage) {
         qaSidebar.answer(chatText);
         return { type: 'accepted', requestId: String(message.requestId || `qa-${Date.now()}`) };
       }
+      // 当前页 pageContext(/qa 与 /figma 共用):chat 消息带 pageContext;回退到 host 侧上下文权威。
+      const snap = contextAuthority.snapshot();
+      const pc = (message.pageContext && Number(message.pageContext.tabId) ? message.pageContext : null)
+        || snap?.pinnedPage || snap?.currentPage || null;
+      const pageContext = pc && Number(pc.tabId)
+        ? { tabId: Number(pc.tabId), url: String(pc.url || ''), title: String(pc.title || '') }
+        : null;
       if (qaSidebar.isQaCommand(chatText)) {
         const requestId = String(message.requestId || `qa-${Date.now()}`);
         const emit = {
@@ -850,14 +859,17 @@ export async function handleIncomingMessage(rawMessage) {
           message: (text) => emitAssistantMessage(requestId, text),
           done: () => emitDone({ requestId }),
         };
-        // 被测目标默认 = 用户当前打开的页(chat 消息带 pageContext;回退到 host 侧上下文权威)。
-        const snap = contextAuthority.snapshot();
-        const pc = (message.pageContext && Number(message.pageContext.tabId) ? message.pageContext : null)
-          || snap?.pinnedPage || snap?.currentPage || null;
-        const pageContext = pc && Number(pc.tabId)
-          ? { tabId: Number(pc.tabId), url: String(pc.url || ''), title: String(pc.title || '') }
-          : null;
         qaSidebar.runQaInSidebar(chatText, emit, pageContext); // 异步跑,进度经 emit 回显
+        return { type: 'accepted', requestId };
+      }
+      if (figmaSidebar.isFigmaCommand(chatText)) {
+        const requestId = String(message.requestId || `figma-${Date.now()}`);
+        const emit = {
+          status: (label) => emitStatus(requestId, label),
+          message: (text) => emitAssistantMessage(requestId, text),
+          done: () => emitDone({ requestId }),
+        };
+        figmaSidebar.runFigmaInSidebar(chatText, emit, pageContext); // 抓当前 Figma tab 选中屏,异步跑
         return { type: 'accepted', requestId };
       }
       const { requestId, attachmentCount } = enqueueChat(message);
