@@ -2,9 +2,21 @@
 // 走官方 REST(个人 token 或组织 Plan Access Token),不走 MCP(免限流/付费),不请求 geometry(矢量点默认不返回)。
 // 压缩(参 Pure Map "完整地图不进上下文"):相对坐标 + 组件去重 + 文本主导样式 + 限深 +
 //   结构相似折叠(大列表→示样1条×N)+ 矢量/图标降噪 + 调色板汇总 + 图片渲染 URL。
-import { assertFigmaToken, figmaToken } from './config.mjs';
+import { assertFigmaToken, getFigmaToken } from './config.mjs';
 
 const API_BASE = 'https://api.figma.com/v1';
+
+// 带 429 退避的 fetch:遇限流读 Retry-After(封顶 30s)等待后重试,最多 retries 次。
+async function figmaFetch(url, { retries = 2 } = {}) {
+  assertFigmaToken();
+  for (let attempt = 0; ; attempt += 1) {
+    const r = await fetch(url, { headers: { 'X-Figma-Token': getFigmaToken() } });
+    if (r.status !== 429 || attempt >= retries) return r;
+    const ra = Number(r.headers?.get?.('retry-after'));
+    const waitMs = (Number.isFinite(ra) && ra > 0 ? Math.min(ra, 30) : (attempt + 1) * 2) * 1000;
+    await new Promise((res) => setTimeout(res, waitMs));
+  }
+}
 
 // 从 figma 链接抽 { fileKey, nodeId }。分享链接 node-id 用 '-',API 用 ':'。
 function parseFigmaUrl(input) {
@@ -17,10 +29,9 @@ function parseFigmaUrl(input) {
 
 // 拉节点子树。返回 { node, components, styles }。不带 geometry(默认即不含矢量点)。
 async function readNode(fileKey, nodeId) {
-  assertFigmaToken();
   if (!fileKey || !nodeId) throw new Error(`Figma 链接解析失败(fileKey=${fileKey} nodeId=${nodeId})`);
   const url = `${API_BASE}/files/${encodeURIComponent(fileKey)}/nodes?ids=${encodeURIComponent(nodeId)}`;
-  const r = await fetch(url, { headers: { 'X-Figma-Token': figmaToken } });
+  const r = await figmaFetch(url);
   if (!r.ok) {
     const body = await r.text().catch(() => '');
     throw new Error(`Figma API ${r.status}: ${body.slice(0, 200)}`);
@@ -141,19 +152,29 @@ function attachImageUrls(node, map) {
   if (node.image && node.id && map[node.id]) node.imageUrl = map[node.id];
   (node.children || []).forEach((c) => attachImageUrls(c, map));
 }
+// 取节点渲染图 URL。⚠️ /v1/images 限流很严(服务端渲染),默认不调用(withImages=false)。
 async function fetchImages(fileKey, ids) {
   if (!ids.length) return {};
-  assertFigmaToken();
   const url = `${API_BASE}/images/${encodeURIComponent(fileKey)}?ids=${ids.map(encodeURIComponent).join(',')}&format=png&scale=1`;
-  const r = await fetch(url, { headers: { 'X-Figma-Token': figmaToken } });
+  const r = await figmaFetch(url);
   if (!r.ok) return {};
   const data = await r.json().catch(() => ({}));
   return data?.images || {};
 }
 
-// 便捷:URL → { fileKey, nodeId, componentList, palette, design }。withImages 时取节点渲染图 URL。
-async function readDesign(url, { withImages = true } = {}) {
+// —— 结果短期缓存(host 内存,键 fileKey:nodeId):重复同屏不再打 API,防限流 ——
+const _cache = new Map();
+const CACHE_TTL_MS = 10 * 60 * 1000;
+
+// 便捷:URL → { fileKey, nodeId, componentList, palette, design }。
+// withImages 默认 false(/v1/images 限流严);refresh 跳过缓存。
+async function readDesign(url, { withImages = false, refresh = false } = {}) {
   const { fileKey, nodeId } = parseFigmaUrl(url);
+  const cacheKey = `${fileKey}:${nodeId}`;
+  if (!withImages && !refresh) {
+    const hit = _cache.get(cacheKey);
+    if (hit && Date.now() - hit.t < CACHE_TTL_MS) return hit.result;
+  }
   const { node, components } = await readNode(fileKey, nodeId);
   const design = compactDesign(node, { components });
   const palette = [...collectPalette(design)];
@@ -162,7 +183,9 @@ async function readDesign(url, { withImages = true } = {}) {
     if (ids.length) { try { attachImageUrls(design, await fetchImages(fileKey, ids)); } catch { /* 图片可选,失败忽略 */ } }
   }
   const componentList = [...new Set(Object.values(components).map((c) => c.name).filter(Boolean))];
-  return { fileKey, nodeId, componentList, palette, design };
+  const result = { fileKey, nodeId, componentList, palette, design };
+  if (!withImages) _cache.set(cacheKey, { t: Date.now(), result });
+  return result;
 }
 
 export { parseFigmaUrl, readNode, compactDesign, collectPalette, structuralSig, readDesign };

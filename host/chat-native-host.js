@@ -845,6 +845,10 @@ export async function handleIncomingMessage(rawMessage) {
         qaSidebar.answer(chatText);
         return { type: 'accepted', requestId: String(message.requestId || `qa-${Date.now()}`) };
       }
+      if (figmaSidebar.hasPending()) { // /figma 等"前端仓库路径"回复
+        figmaSidebar.answer(chatText);
+        return { type: 'accepted', requestId: String(message.requestId || `figma-${Date.now()}`) };
+      }
       // 当前页 pageContext(/qa 与 /figma 共用):chat 消息带 pageContext;回退到 host 侧上下文权威。
       const snap = contextAuthority.snapshot();
       const pc = (message.pageContext && Number(message.pageContext.tabId) ? message.pageContext : null)
@@ -869,7 +873,14 @@ export async function handleIncomingMessage(rawMessage) {
           message: (text) => emitAssistantMessage(requestId, text),
           done: () => emitDone({ requestId }),
         };
-        figmaSidebar.runFigmaInSidebar(chatText, emit, pageContext); // 抓当前 Figma tab 选中屏,异步跑
+        // 加载模式:读设计 → 注入当前会话(用侧栏 cwd;非前端仓库会先问用户)。之后续聊即在该仓库开发。
+        figmaSidebar.runFigmaInSidebar(chatText, emit, pageContext, {
+          cwd: String(message.cwd || ''),
+          inject: (repo, prompt) => {
+            try { enqueueChat({ type: 'chat', prompt, cwd: repo, sessionId: message.sessionId }); }
+            catch (e) { emitAssistantMessage(requestId, `注入开发会话失败:${e?.message || e}`); }
+          },
+        });
         return { type: 'accepted', requestId };
       }
       const { requestId, attachmentCount } = enqueueChat(message);

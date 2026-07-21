@@ -70,4 +70,22 @@ function buildDevPrompt({ design, componentList = [], palette = [], pageName, st
   ].join('\n');
 }
 
-export { buildDevPrompt, walkSpec };
+// 加载模式:把设计作为"上下文"注入开发会话——先别动手,以当前仓库(cwd)的组件库为准。
+function buildLoadContext({ design, componentList = [], palette = [], pageName } = {}) {
+  const name = pageName || design?.name || '页面';
+  const specLines = [];
+  walkSpec(design, 0, specLines);
+  const paletteLine = palette.length ? `\n用色:${palette.join('  ')}` : '';
+  const figmaComps = componentList.length ? `\nFigma 组件名(作映射线索):${componentList.join('、')}` : '';
+  return [
+    `【已加载 Figma 设计:${name}】以下是设计上下文,先记住。`,
+    '**先别动手写代码**,等我明确说「开发这个页面 / 把 X 改成 Y / 调样式」再做。',
+    '开发时:用**当前仓库(你所在的 cwd)**的组件库 —— 先扫 `src/components` 与 `package.json` 确认可用组件与技术栈,再据此实现;下方 Figma 组件名作映射线索;严格按尺寸/间距/颜色还原,auto-layout 的 gap/padding 用 flex。',
+    figmaComps + paletteLine,
+    '',
+    '## 设计还原(px;〔组件〕=用当前仓库对应组件;×N=同款只列示样)',
+    specLines.join('\n'),
+  ].join('\n');
+}
+
+export { buildDevPrompt, walkSpec, buildLoadContext };

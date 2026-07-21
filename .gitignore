@@ -14,6 +14,11 @@ host/chat-native-host-wrapper.sh
 claude-sidebar-patch/
 # 编译产物(spawn-clean.c 可重建,不提交二进制)
 host/spawn-clean
+# Chrome 打包扩展产物 + 私钥(.pem 是签名私钥,绝不入库)
+extension.crx
+extension.pem
+*.crx
+*.pem
 
 # AI dev tools (aid init 生成，勿提交)
 CLAUDE.md

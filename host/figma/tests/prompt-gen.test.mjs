@@ -1,8 +1,11 @@
 // /figma 提示词生成 + 命令识别(纯函数)。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildDevPrompt } from '../prompt-gen.mjs';
-import { isFigmaCommand } from '../sidebar-command.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { buildDevPrompt, buildLoadContext } from '../prompt-gen.mjs';
+import { isFigmaCommand, isFrontendRepo, parseFigmaCommand } from '../sidebar-command.mjs';
 import { exchangeWebNuxt, stackText } from '../component-lib.mjs';
 
 test('isFigmaCommand:仅 /figma 开头命中', () => {
@@ -20,6 +23,31 @@ const DESIGN = {
     { type: 'INSTANCE', name: '按钮', component: 'PrimaryButton', box: { x: 16, y: 60, w: 343, h: 44 } },
   ],
 };
+
+test('parseFigmaCommand:抽页面名 + --images 开关', () => {
+  assert.deepEqual(parseFigmaCommand('/figma tradfi-activity'), { pageName: 'tradfi-activity', withImages: false });
+  assert.deepEqual(parseFigmaCommand('/figma tradfi --images'), { pageName: 'tradfi', withImages: true });
+  assert.deepEqual(parseFigmaCommand('/figma'), { pageName: null, withImages: false });
+});
+
+test('isFrontendRepo:含前端依赖 package.json→true;空目录/空路径→false', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fe-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ dependencies: { vue: '^2.7' } }));
+  assert.equal(isFrontendRepo(dir), true);
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'empty-'));
+  assert.equal(isFrontendRepo(empty), false);
+  assert.equal(isFrontendRepo(''), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(empty, { recursive: true, force: true });
+});
+
+test('buildLoadContext:加载语气 + 以当前仓库为准 + 设计大纲', () => {
+  const c = buildLoadContext({ design: DESIGN, componentList: ['PrimaryButton'], palette: ['#000000'], pageName: 'tradfi' });
+  assert.match(c, /已加载 Figma 设计:tradfi/);
+  assert.match(c, /先别动手/);
+  assert.match(c, /当前仓库/);
+  assert.match(c, /TradFi 活动/); // design 文案进大纲
+});
 
 test('buildDevPrompt:还原大纲 + 文案 + 组件标注 + 无组件库时退化提示', () => {
   const p = buildDevPrompt({ design: DESIGN, componentList: ['PrimaryButton'], pageName: 'TradFi 活动页' });

@@ -30,11 +30,12 @@ const fileEnv = parseEnvFile(ENV_LOCAL);
 function readVar(name) { return process.env[name] ?? fileEnv[name] ?? ''; }
 
 // Figma 个人访问令牌(scope: file_content:read)或组织签发的 Plan Access Token。
-export const figmaToken = readVar('FIGMA_TOKEN');
+// 惰性读取(每次调用现取):便于测试用 env 覆盖,也更正确。
+export function getFigmaToken() { return readVar('FIGMA_TOKEN'); }
 
 // 断言 token 存在,缺失时报清晰错误(绝不打印值)。
 export function assertFigmaToken() {
-  if (!figmaToken) {
+  if (!getFigmaToken()) {
     throw new Error('缺少 FIGMA_TOKEN(请在 host/figma/.env.local 配置;Figma→Settings→Security 生成,scope 勾 file_content:read)');
   }
 }
