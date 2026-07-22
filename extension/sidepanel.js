@@ -367,6 +367,10 @@ function handleNativeMessage(message) {
       flushThreadStream("main");
       if (message.content) appendThreadMessage("main", "assistant", message.content);
       break;
+    case "command_output":
+      flushThreadStream("main");
+      if (message.text) appendCommandOutput(message.text, { command: message.command, isError: message.isError });
+      break;
     case "rate_limit":
       handleRateLimit(message.info || {});
       break;
@@ -499,6 +503,22 @@ function renderMessageRecord(record, parent = els.messages, options = {}) {
   let textNode = null;
   let streamingView = null;
 
+  // 斜杠命令输出(/cost 等):等宽 + 保留换行的样式块,不走 Markdown(避免换行被吃)。
+  if (record.kind === "command_output") {
+    row.className = "message assistant";
+    bubble.classList.add("message-content");
+    const header = document.createElement("div");
+    header.className = "command-output-header";
+    header.textContent = record.command ? `命令输出 · ${record.command}` : "命令输出";
+    const pre = document.createElement("pre");
+    pre.className = `command-output${record.isError ? " command-output-error" : ""}`;
+    pre.textContent = record.text || "";
+    bubble.append(header, pre);
+    row.appendChild(bubble);
+    parent.appendChild(row);
+    return { row, bubble, textNode: null, streamingView: null };
+  }
+
   if (record.role === "assistant") {
     const avatar = document.createElement("div");
     avatar.className = "message-avatar";
@@ -534,6 +554,20 @@ function renderMessageRecord(record, parent = els.messages, options = {}) {
 
   parent.appendChild(row);
   return { row, bubble, textNode, streamingView };
+}
+
+// 命令输出:作为一条 assistant 记录追加,但打 command_output 标 → 渲染成等宽样式块。
+function appendCommandOutput(text, meta = {}) {
+  const record = createMessageRecord("main", "assistant", text);
+  record.kind = "command_output";
+  record.command = meta.command || null;
+  record.isError = Boolean(meta.isError);
+  if (state.activeThreadId === "main") {
+    els.emptyState.hidden = true;
+    const shouldStick = isNearBottom();
+    renderMessageRecord(record);
+    if (shouldStick) scheduleScrollToBottom(true);
+  }
 }
 
 function appendThreadMessage(threadId, role, text) {
@@ -1224,23 +1258,43 @@ function commandQuery() {
   return firstLine.slice(1).toLowerCase();
 }
 
+// 内置合成命令:不随 capabilities(system/init 的 slash_commands)一起下发的命令。
+// 包含本扩展自建的 /qa,以及 Claude Code 的内置 CLI 命令(/cost 等,不在 slash_commands 里)。
+// 注入斜杠菜单让其可被发现;即使 Claude Code 尚未启动也照常显示。
+const BUILTIN_COMMANDS = [
+  { name: "qa", argumentHint: "<PRD链接> [被测页URL]", description: "飞书 PRD 自动化测试:读需求→生成脚本→人审→重放→结果播报" },
+  { name: "figma", description: "读当前 Figma 选中屏 → 生成前端开发提示词(用项目组件)" },
+  { name: "figma-ws", argumentHint: "[页面名]", description: "拦 WS 直读当前 Figma 选中屏(免 token/免限流) → 加载进会话开发" },
+  { name: "cost", description: "显示本次会话的 token 用量与花费" },
+  { name: "context", description: "查看当前上下文占用明细" },
+  { name: "status", description: "查看 Claude Code 运行状态" },
+  { name: "model", argumentHint: "[模型名]", description: "查看或切换模型" },
+  { name: "config", description: "查看 / 修改配置" },
+  { name: "compact", description: "压缩当前会话上下文" },
+  { name: "clear", description: "清空当前会话" },
+  { name: "agents", description: "查看可用子代理" },
+  { name: "resume", description: "恢复历史会话" },
+  { name: "help", description: "查看可用命令帮助" },
+];
+
 function updateCommandMenu() {
   const query = commandQuery();
   if (query == null) {
     hideCommandMenu();
     return;
   }
+  // 原生命令未加载 → 后台拉起 Claude Code 读取;内置命令不受影响,继续往下渲染。
   if (!state.commands.length && state.connected && !state.busy) {
     setStatus("正在启动 Claude Code 并读取 Commands…", true);
     prepareSession();
-    hideCommandMenu();
-    return;
   }
-  if (!state.commands.length) {
-    hideCommandMenu();
-    return;
+  // 内置命令 + capabilities 命令,按 name 去重(内置优先),再按输入过滤。
+  const byName = new Map();
+  for (const command of [...BUILTIN_COMMANDS, ...state.commands]) {
+    const name = String(command.name || "").toLowerCase();
+    if (name && !byName.has(name)) byName.set(name, command);
   }
-  const matches = state.commands
+  const matches = [...byName.values()]
     .filter((command) => String(command.name || "").toLowerCase().includes(query))
     .slice(0, 12);
   if (!matches.length) {

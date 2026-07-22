@@ -8,6 +8,12 @@ import { randomUUID } from 'node:crypto';
 import { prepareChatMessageAttachments, cleanupOldAttachments, chatAttachmentLimits } from './chat-attachment-store.mjs';
 import { createChatContextAuthority } from './chat-context-authority.mjs';
 import { PURE_MAP_CLAUDE_TOOL_NAMES, PURE_MAP_SERVER_NAME, validateClaudeToolSurface, formatPureMapToolInventory } from './mcp-tool-surface.mjs';
+// QA 侧栏命令(/qa):在 chat 层拦截,跑 host 侧编排器,不转 Claude CLI。逻辑在 host/qa/。
+import * as qaSidebar from './qa/sidebar-command.mjs';
+// Figma 侧栏命令(/figma):抓当前 Figma tab 选中屏 → 读设计 → 生成前端提示词。逻辑在 host/figma/。
+import * as figmaSidebar from './figma/sidebar-command.mjs';
+// Figma-WS 侧栏命令(/figma-ws):独立于 REST,全自动拦 WS fig-kiwi 帧 → 解码抽子树 → 加载进会话。逻辑在 host/figma-ws/。
+import * as figmaWsSidebar from './figma-ws/sidebar-command.mjs';
 
 const VERSION = '0.15.3';
 const HOST_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -179,6 +185,59 @@ function emitDone(state) {
   } else {
     writeNative({ type: 'assistant_done', requestId: state.requestId });
   }
+}
+// 斜杠命令输出(/cost 等):独立类型,侧栏渲染成保留换行的等宽块(不当普通 Markdown)。
+function emitCommandOutput(requestId, text, extra = {}) {
+  if (!text) return;
+  writeNative({ type: 'command_output', requestId, text, ...extra });
+}
+
+// ── 斜杠命令 / agent 能力发现 ─────────────────────────────────────
+// Claude 的 system/init 事件带 slash_commands(技能/自定义/插件命令)+ agents;
+// 侧栏斜杠菜单据此渲染。此前 init 只取了 tools,命令列表一直为空。缓存一次避免重复探。
+let cachedCapabilities = null;
+function capabilitiesFromInit(event) {
+  const slash = Array.isArray(event?.slash_commands) ? event.slash_commands : [];
+  const agents = Array.isArray(event?.agents) ? event.agents : [];
+  if (!slash.length && !agents.length) return null;
+  return {
+    type: 'capabilities',
+    capabilitiesStatus: 'loaded',
+    commands: slash.map((name) => ({ name: String(name) })),
+    agents: agents.map((name) => ({ name: String(name) })),
+  };
+}
+function emitCapabilities(event) {
+  const caps = capabilitiesFromInit(event);
+  if (!caps) return;
+  cachedCapabilities = caps;
+  writeNative(caps);
+}
+// 连上/新会话时异步探一次 claude:读到 init 就抽命令、emit、随即 kill(拿到 init 即停,
+// 几乎不产 token)。已缓存则直接复用不再 spawn;失败静默(不影响会话)。
+function probeCapabilities() {
+  if (cachedCapabilities) { writeNative(cachedCapabilities); return; }
+  let child;
+  try {
+    child = spawn(process.env.CLAUDE_SIDEBAR_CLAUDE_BIN || 'claude',
+      ['-p', '--output-format', 'stream-json', '--verbose', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'],
+      { cwd: os.tmpdir(), env: process.env, stdio: ['pipe', 'pipe', 'ignore'] });
+  } catch (error) { logHost('capabilities_probe_spawn_failed', { error: String(error) }); return; }
+  let buf = '';
+  const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 30000);
+  const stop = () => { clearTimeout(killer); try { child.kill('SIGKILL'); } catch {} };
+  child.stdout.on('data', (chunk) => {
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      if (event?.type === 'system' && event.subtype === 'init') { emitCapabilities(event); stop(); return; }
+    }
+  });
+  child.on('error', (error) => { clearTimeout(killer); logHost('capabilities_probe_error', { error: String(error) }); });
+  try { child.stdin.write('hi'); child.stdin.end(); } catch {}
 }
 function stripManagedClaudeArgs(input) {
   const result = [];
@@ -401,6 +460,7 @@ function parseStreamLine(state, line) {
         return;
       }
       emitStatus(state.requestId, '浏览器地图工具已加载', 'running', JSON.stringify({ server: PURE_MAP_SERVER_NAME, tools: surface.expected }));
+      emitCapabilities(event); // 顺带把 slash_commands/agents 喂给侧栏斜杠菜单
       if (state.inventoryIntent) {
         const inventory = formatPureMapToolInventory(surface);
         emitAssistantMessage(state.requestId, inventory);
@@ -417,7 +477,7 @@ function parseStreamLine(state, line) {
     const stdoutMatch = localOutput.match(/<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/);
     const stderrMatch = localOutput.match(/<local-command-stderr>([\s\S]*?)<\/local-command-stderr>/);
     const surfaced = [stdoutMatch?.[1], stderrMatch?.[1]].filter((part) => part && part.trim()).join('\n').trim();
-    if (surfaced) emitAssistantMessage(state.requestId, surfaced);
+    if (surfaced) emitCommandOutput(state.requestId, surfaced, { command: state.slashCommand || null, isError: Boolean(stderrMatch?.[1] && !stdoutMatch?.[1]) });
     return;
   }
   if (type === 'stream_event') {
@@ -601,7 +661,7 @@ function startChat(message, enqueuedAt = Date.now()) {
   // Resume must run in the same project the session was created in, else the CLI
   // cannot re-open the transcript — reuse the pinned cwd once a session exists.
   const effectiveCwd = cli.resume && cli.cliCwd ? cli.cliCwd : cwdSelection.cwd;
-  const { prompt, attachments } = buildPrompt(message, { resume: cli.resume });
+  const { prompt, attachments, slashCommand } = buildPrompt(message, { resume: cli.resume });
   const command = process.env.CLAUDE_SIDEBAR_CLAUDE_BIN || 'claude';
   const args = parseArgs(cli);
   const mcpConfig = String(process.env.CLAUDE_SIDEBAR_MCP_CONFIG || '').trim();
@@ -621,6 +681,7 @@ function startChat(message, enqueuedAt = Date.now()) {
     sessionId,
     cli,
     child,
+    slashCommand: slashCommand || null,
     buffer: '',
     stderr: '',
     lastAssistantText: '',
@@ -751,11 +812,13 @@ export async function handleIncomingMessage(rawMessage) {
     case 'new_session':
       cleanupOldAttachments();
       currentSessionId = null;
+      probeCapabilities(); // 异步拉命令列表,连上就能打 / 看到全部命令
       return legacySessionPrepared({ ...message, sessionId: normalizedSessionId({}, true) });
     case 'prepare_session':
     case 'select_session':
     case 'resume_session':
       cleanupOldAttachments();
+      probeCapabilities(); // 异步拉命令列表,连上就能打 / 看到全部命令
       return legacySessionPrepared(message);
     case 'list_sessions':
       return legacySessionsReply(message);
@@ -778,6 +841,71 @@ export async function handleIncomingMessage(rawMessage) {
     case 'context_status':
       return { type: 'context_status', version: VERSION, selection: contextAuthority.snapshot() };
     case 'chat': {
+      // QA 拦截:①人审待确认时,这条消息作为 y/n 回答;②/qa 命令 → 跑编排器,不转 Claude CLI。
+      const chatText = String(message.prompt ?? message.message ?? message.text ?? message.content ?? '');
+      if (qaSidebar.hasPending()) {
+        qaSidebar.answer(chatText);
+        return { type: 'accepted', requestId: String(message.requestId || `qa-${Date.now()}`) };
+      }
+      if (figmaSidebar.hasPending()) { // /figma 等"前端仓库路径"回复
+        figmaSidebar.answer(chatText);
+        return { type: 'accepted', requestId: String(message.requestId || `figma-${Date.now()}`) };
+      }
+      if (figmaWsSidebar.hasPending()) { // /figma-ws 等"前端仓库路径"回复
+        figmaWsSidebar.answer(chatText);
+        return { type: 'accepted', requestId: String(message.requestId || `figma-ws-${Date.now()}`) };
+      }
+      // 当前页 pageContext(/qa 与 /figma 共用):chat 消息带 pageContext;回退到 host 侧上下文权威。
+      const snap = contextAuthority.snapshot();
+      const pc = (message.pageContext && Number(message.pageContext.tabId) ? message.pageContext : null)
+        || snap?.pinnedPage || snap?.currentPage || null;
+      const pageContext = pc && Number(pc.tabId)
+        ? { tabId: Number(pc.tabId), url: String(pc.url || ''), title: String(pc.title || '') }
+        : null;
+      if (qaSidebar.isQaCommand(chatText)) {
+        const requestId = String(message.requestId || `qa-${Date.now()}`);
+        const emit = {
+          status: (label) => emitStatus(requestId, label),
+          message: (text) => emitAssistantMessage(requestId, text),
+          done: () => emitDone({ requestId }),
+        };
+        qaSidebar.runQaInSidebar(chatText, emit, pageContext); // 异步跑,进度经 emit 回显
+        return { type: 'accepted', requestId };
+      }
+      if (figmaSidebar.isFigmaCommand(chatText)) {
+        const requestId = String(message.requestId || `figma-${Date.now()}`);
+        const emit = {
+          status: (label) => emitStatus(requestId, label),
+          message: (text) => emitAssistantMessage(requestId, text),
+          done: () => emitDone({ requestId }),
+        };
+        // 加载模式:读设计 → 注入当前会话(用侧栏 cwd;非前端仓库会先问用户)。之后续聊即在该仓库开发。
+        figmaSidebar.runFigmaInSidebar(chatText, emit, pageContext, {
+          cwd: String(message.cwd || ''),
+          inject: (repo, prompt) => {
+            try { enqueueChat({ type: 'chat', prompt, cwd: repo, sessionId: message.sessionId }); }
+            catch (e) { emitAssistantMessage(requestId, `注入开发会话失败:${e?.message || e}`); }
+          },
+        });
+        return { type: 'accepted', requestId };
+      }
+      if (figmaWsSidebar.isFigmaWsCommand(chatText)) {
+        const requestId = String(message.requestId || `figma-ws-${Date.now()}`);
+        const emit = {
+          status: (label) => emitStatus(requestId, label),
+          message: (text) => emitAssistantMessage(requestId, text),
+          done: () => emitDone({ requestId }),
+        };
+        // 独立 WS 管道:全自动抓帧 → 解码抽子树 → 注入会话(cwd 用侧栏;非前端仓库先问)。
+        figmaWsSidebar.runFigmaWsInSidebar(chatText, emit, pageContext, {
+          cwd: String(message.cwd || ''),
+          inject: (repo, prompt) => {
+            try { enqueueChat({ type: 'chat', prompt, cwd: repo, sessionId: message.sessionId }); }
+            catch (e) { emitAssistantMessage(requestId, `注入开发会话失败:${e?.message || e}`); }
+          },
+        });
+        return { type: 'accepted', requestId };
+      }
       const { requestId, attachmentCount } = enqueueChat(message);
       return { type: 'accepted', requestId, attachmentCount, authoritativePage: contextAuthority.snapshot()?.pinnedPage || contextAuthority.snapshot()?.nextPage || null };
     }

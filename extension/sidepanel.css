@@ -105,6 +105,10 @@ button { cursor: pointer; }
 .message.user .bubble { background: var(--user); border-bottom-right-radius: 4px; }
 .message.assistant .bubble { background: var(--assistant); border-bottom-left-radius: 4px; box-shadow: 0 3px 12px rgba(0,0,0,.025); }
 .message.error .bubble { border-color: rgba(190, 55, 55, .35); color: #bd3d3d; }
+/* 斜杠命令输出(/cost 等):等宽 + 保留换行的样式块 */
+.command-output-header { font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent); margin-bottom: 5px; }
+.command-output { margin: 0; padding: 8px 10px; border-radius: 8px; background: var(--user); border: 1px solid var(--line); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: auto; }
+.command-output-error { color: #bd3d3d; border-color: rgba(190, 55, 55, .35); }
 .cursor::after { content: "▍"; color: var(--accent); animation: blink .9s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
