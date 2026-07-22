@@ -70,6 +70,8 @@ const state = {
   threadPersistTimer: null,
   queuedRequestIds: new Set(),
   currentPage: null,
+  pinnedPageForSession: null,   // 本会话钉定的 CURRENT PAGE(对话开始时确定,切标签不改)
+  pinnedPageSessionId: null,    // 钉定时的 sessionId(null=首条发送时会话 id 尚未分配)
   currentPermission: null,
   currentQuestion: null,
   commands: [],
@@ -1052,6 +1054,17 @@ function restoreAgentThreadsForSession(sessionId) {
 }
 
 
+// 本会话是否已钉定 CURRENT PAGE。吸收 sessionId 的 null→已分配 升级(视为同一会话,保持钉定);
+// 只有换成不同的 sessionId(切换/新建会话)才算新对话、需要重钉。
+function isPinnedForCurrentConversation() {
+  if (!state.pinnedPageForSession) return false;
+  const pinned = state.pinnedPageSessionId;
+  const now = state.sessionId;
+  if (pinned === now) return true;
+  if (pinned == null && now != null) { state.pinnedPageSessionId = now; return true; } // 升级锚点,不重钉
+  return false;
+}
+
 async function adoptCurrentTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return null;
@@ -1077,7 +1090,17 @@ async function sendPrompt(rawPrompt) {
     return;
   }
 
-  const pageContext = state.settings.includePageContext ? await adoptCurrentTab() : null;
+  // CURRENT PAGE 在对话开始时钉定:本会话已钉→复用;首条消息/新会话→抓当前标签并钉。
+  let pageContext = null;
+  if (state.settings.includePageContext) {
+    if (isPinnedForCurrentConversation()) {
+      pageContext = state.pinnedPageForSession;
+    } else {
+      pageContext = await adoptCurrentTab();
+      state.pinnedPageForSession = pageContext;
+      state.pinnedPageSessionId = state.sessionId;
+    }
+  }
   const requestId = crypto.randomUUID();
   state.requestThreads.set(requestId, threadId);
   appendThreadMessage(threadId, "user", prompt);
@@ -1738,9 +1761,10 @@ document.querySelectorAll("[data-prompt]").forEach((button) => {
   button.addEventListener("click", () => sendPrompt(button.dataset.prompt));
 });
 
-chrome.tabs.onActivated.addListener(adoptCurrentTab);
+// 会话钉定 CURRENT PAGE 后,切换/刷新标签不再改它(对话开始时已确定);未钉定(首条消息前/新会话)才跟随。
+chrome.tabs.onActivated.addListener(() => { if (!isPinnedForCurrentConversation()) adoptCurrentTab(); });
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
-  if (tab.active && (info.url || info.title || info.status === "complete")) adoptCurrentTab();
+  if (tab.active && (info.url || info.title || info.status === "complete") && !isPinnedForCurrentConversation()) adoptCurrentTab();
 });
 
 (async () => {

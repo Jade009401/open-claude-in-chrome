@@ -437,6 +437,9 @@ function extractText(event) {
   if (!Array.isArray(content)) return '';
   return content.filter((part) => part?.type === 'text' && typeof part.text === 'string').map((part) => part.text).join('');
 }
+// "浏览器地图工具已加载" 每会话只报一次:每轮 Claude Code init 都触发校验,若每轮都 emit
+// 会让人误以为每轮在加载地图(实际只是工具面校验、地图是服务端缓存复用)。
+const mapToolStatusShownSessions = new Set();
 function parseStreamLine(state, line) {
   let event;
   try { event = JSON.parse(line); } catch { return; }
@@ -459,8 +462,13 @@ function parseStreamLine(state, line) {
         try { state.child.kill('SIGINT'); } catch {}
         return;
       }
-      emitStatus(state.requestId, '浏览器地图工具已加载', 'running', JSON.stringify({ server: PURE_MAP_SERVER_NAME, tools: surface.expected }));
-      emitCapabilities(event); // 顺带把 slash_commands/agents 喂给侧栏斜杠菜单
+      const mapStatusSid = state.sessionId || state.requestId;
+      if (!mapToolStatusShownSessions.has(mapStatusSid)) {
+        if (mapToolStatusShownSessions.size > 1000) mapToolStatusShownSessions.clear(); // 软上限,防无限增长
+        mapToolStatusShownSessions.add(mapStatusSid);
+        emitStatus(state.requestId, '浏览器地图工具已加载', 'running', JSON.stringify({ server: PURE_MAP_SERVER_NAME, tools: surface.expected }));
+      }
+      emitCapabilities(event); // 顺带把 slash_commands/agents 喂给侧栏斜杠菜单(每轮都要,保持菜单最新)
       if (state.inventoryIntent) {
         const inventory = formatPureMapToolInventory(surface);
         emitAssistantMessage(state.requestId, inventory);
