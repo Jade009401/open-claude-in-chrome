@@ -20,16 +20,59 @@ if [[ $# -lt 1 ]]; then
 fi
 EXT_IDS=("$@")
 
-# ---- 1. 路径与依赖 --------------------------------------------------------
+# ---- 0.5 环境预检测(装前查齐;🔴硬失败先列清单再退出,不装到一半才崩;🟡警告不阻断)----
+# 顺带把 NODE_BIN / CLAUDE_BIN 设为全局供后续使用。
+preflight() {
+  local hard_fail=0
+  echo "环境预检测:"
+
+  # 🔴 macOS —— 脚本依赖 launchd 与 ~/Library,仅支持 macOS
+  if [[ "$(uname -s)" == "Darwin" ]]; then echo "  ✔ 系统 macOS"
+  else echo "  ✗ 系统非 macOS(当前 $(uname -s))—— 本安装脚本仅支持 macOS"; hard_fail=1; fi
+
+  # 🔴 Node ≥ 20
+  NODE_BIN="$(command -v node || true)"
+  if [[ -z "$NODE_BIN" ]]; then
+    echo "  ✗ 未找到 node —— 需 Node.js ≥ 20"; hard_fail=1
+  else
+    local major; major="$("$NODE_BIN" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+    if [[ "$major" -lt 20 ]]; then echo "  ✗ Node 版本过低($("$NODE_BIN" -v))—— 需 ≥ 20"; hard_fail=1
+    else echo "  ✔ Node $("$NODE_BIN" -v)"; fi
+  fi
+
+  # 🔴 npm —— 装 host 依赖(含 kiwi-schema / fzstd)
+  if command -v npm >/dev/null 2>&1; then echo "  ✔ npm $(npm -v 2>/dev/null)"
+  else echo "  ✗ 未找到 npm —— 无法安装 host 依赖"; hard_fail=1; fi
+
+  # 🟡 claude CLI —— 侧栏 daemon 与浏览器自动化 MCP 都需要
+  CLAUDE_BIN="$(command -v claude || true)"
+  if [[ -n "$CLAUDE_BIN" ]]; then echo "  ✔ claude CLI"
+  else echo "  ⚠ 未找到 claude CLI —— 侧栏 / 浏览器 MCP 需要它(装完请确保 claude 可用并已登录)"; fi
+
+  # 🟡 git —— run-from-clone 更新(git pull)用
+  if command -v git >/dev/null 2>&1; then echo "  ✔ git"
+  else echo "  ⚠ 未找到 git —— run-from-clone 更新会用到"; fi
+
+  # 🟡 至少一个受支持的 Chromium 浏览器(看 Application Support 目录)
+  local found=""
+  for b in "Google/Chrome" "Microsoft Edge" "BraveSoftware/Brave-Browser" "Arc/User Data"; do
+    [[ -d "$HOME/Library/Application Support/$b" ]] && { found="$b"; break; }
+  done
+  if [[ -n "$found" ]]; then echo "  ✔ 检测到 Chromium 浏览器($found)"
+  else echo "  ⚠ 未检测到受支持的 Chromium 浏览器(Chrome/Edge/Brave/Arc)—— 请先安装并在 chrome://extensions 加载 extension/"; fi
+
+  if [[ "$hard_fail" -ne 0 ]]; then
+    echo ""
+    echo "环境预检测未通过(见上方 ✗)。请补齐必需项后重跑 ./install.sh。"
+    exit 1
+  fi
+  echo ""
+}
+preflight
+
+# ---- 1. 路径(NODE_BIN / CLAUDE_BIN 已在 preflight 设置) --------------------
 HOST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/host" && pwd)"   # <clone>/host
 REPO_DIR="$(cd "$HOST_DIR/.." && pwd)"                          # <clone>
-NODE_BIN="$(command -v node || true)"
-CLAUDE_BIN="$(command -v claude || true)"
-
-[[ -z "$NODE_BIN" ]] && { echo "错误:未找到 node,请先安装 Node.js ≥ 20"; exit 1; }
-NODE_MAJOR="$("$NODE_BIN" -p 'process.versions.node.split(".")[0]')"
-[[ "$NODE_MAJOR" -lt 20 ]] && { echo "错误:需要 Node ≥ 20(当前 $("$NODE_BIN" -v))"; exit 1; }
-[[ -z "$CLAUDE_BIN" ]] && echo "警告:未找到 claude CLI —— 侧栏 daemon 与浏览器自动化 MCP 都需要它。"
 
 # ---- 2. host 依赖(含 Agent SDK) -----------------------------------------
 if [[ ! -d "$HOST_DIR/node_modules/@anthropic-ai/claude-agent-sdk" ]]; then
