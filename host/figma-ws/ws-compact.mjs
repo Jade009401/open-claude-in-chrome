@@ -71,9 +71,7 @@ function wsCompact(rootKey, idx, { maxDepth = 12 } = {}) {
     if (!n || n.visible === false || SKIP.has(n.type)) return null;
     if (ICON_LEAF.has(n.type)) return { type: 'ICON', name: n.name }; // 矢量降噪:不下钻路径点
     const box = boxOf(n);
-    if (n.type !== 'TEXT' && (box.w < 1 || box.h < 1)) return null; // 零尺寸(非文本)丢
-
-    const out = { type: n.type, name: n.name, box };
+    const out = { type: n.type, name: n.name, box }; // C:零尺寸判定移到"查完子"之后(见末尾)
 
     if (n.type === 'TEXT') {
       out.text = n.textData?.characters || '';
@@ -85,7 +83,13 @@ function wsCompact(rootKey, idx, { maxDepth = 12 } = {}) {
     if ((n.fillPaints || []).some((p) => p.type === 'IMAGE' && p.visible !== false)) out.image = true; // WS 只有 hash 无 URL,仅标记
     const fill = firstSolid(n.fillPaints);
     if (fill) out.fill = fill;
-    if (n.cornerRadius) out.radius = Math.round(n.cornerRadius);
+    // D:圆角 —— 优先统一 cornerRadius;否则读逐角(CSS 序 tl/tr/br/bl)。缺角默认 0;统一出单值,不等出 "tl/tr/br/bl"。
+    if (n.cornerRadius) {
+      out.radius = Math.round(n.cornerRadius);
+    } else {
+      const cs = [n.rectangleTopLeftCornerRadius, n.rectangleTopRightCornerRadius, n.rectangleBottomRightCornerRadius, n.rectangleBottomLeftCornerRadius].map((v) => Math.round(v || 0));
+      if (cs.some((v) => v > 0)) out.radius = cs.every((v) => v === cs[0]) ? cs[0] : cs.join('/');
+    }
     if (n.stackMode && n.stackMode !== 'NONE') {
       out.layout = {
         dir: n.stackMode === 'HORIZONTAL' ? 'row' : 'col',
@@ -108,6 +112,8 @@ function wsCompact(rootKey, idx, { maxDepth = 12 } = {}) {
     if (box.w <= 48 && box.h <= 48 && !out.text && out.children && out.children.length && out.children.every((c) => c.type === 'ICON')) {
       return { type: 'ICON', name: out.name, box };
     }
+    // C:零尺寸容器且无有效子 → 丢(不可见);有子的零尺寸容器保留(如 375×0 裹着分隔线的组)
+    if ((box.w < 1 || box.h < 1) && !(out.children && out.children.length)) return null;
     return out;
   }
   return walk(rootKey, 0);

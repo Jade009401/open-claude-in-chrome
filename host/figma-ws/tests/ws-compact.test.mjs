@@ -91,3 +91,47 @@ test('子树外节点绝不出现(scoping 生效)', () => {
 test('node-id 未命中 → 抛人话错误', () => {
   assert.throws(() => designFromNodeChanges(nodeChanges, '9-999'), /未在场景图命中/);
 });
+
+// —— C(零尺寸判定后移)+ D(逐角圆角)专用 fixture ——
+const R2 = { sessionID: 7, localID: 1 };
+const pi2 = (pos) => ({ guid: R2, position: pos });
+const cornerNodes = [
+  { guid: R2, type: 'FRAME', name: '根', visible: true, transform: xf(0, 0), size: { x: 400, y: 400 } },
+  // 逐角不等 → "8/8/0/0"(tl/tr/br/bl)。尺寸各异,避免被 collapseRepeats 同款折叠。
+  { guid: { sessionID: 7, localID: 2 }, type: 'ROUNDED_RECTANGLE', name: '上圆角卡', visible: true, parentIndex: pi2('a'),
+    transform: xf(0, 0), size: { x: 100, y: 40 },
+    rectangleTopLeftCornerRadius: 8, rectangleTopRightCornerRadius: 8, rectangleBottomRightCornerRadius: 0, rectangleBottomLeftCornerRadius: 0 },
+  // 逐角相等 → 单值 6
+  { guid: { sessionID: 7, localID: 3 }, type: 'ROUNDED_RECTANGLE', name: '四角同', visible: true, parentIndex: pi2('b'),
+    transform: xf(0, 50), size: { x: 120, y: 40 },
+    rectangleTopLeftCornerRadius: 6, rectangleTopRightCornerRadius: 6, rectangleBottomRightCornerRadius: 6, rectangleBottomLeftCornerRadius: 6 },
+  // 统一 cornerRadius → 单值 12
+  { guid: { sessionID: 7, localID: 4 }, type: 'ROUNDED_RECTANGLE', name: '统一角', visible: true, parentIndex: pi2('c'),
+    transform: xf(0, 100), size: { x: 140, y: 40 }, cornerRadius: 12 },
+  // 零尺寸容器但有可见文本子 → 整棵保留
+  { guid: { sessionID: 7, localID: 5 }, type: 'FRAME', name: '零尺寸有子', visible: true, parentIndex: pi2('d'),
+    transform: xf(0, 150), size: { x: 375, y: 0 } },
+  { guid: { sessionID: 7, localID: 6 }, type: 'TEXT', name: '分隔标', visible: true,
+    parentIndex: { guid: { sessionID: 7, localID: 5 }, position: 'a' }, transform: xf(0, 0), size: { x: 80, y: 16 },
+    textData: { characters: '在零尺寸容器里' } },
+  // 零尺寸叶子无子 → 丢
+  { guid: { sessionID: 7, localID: 7 }, type: 'FRAME', name: '零尺寸空', visible: true, parentIndex: pi2('e'),
+    transform: xf(0, 200), size: { x: 0, y: 0 } },
+];
+
+test('D:逐角圆角 —— 不等出 tl/tr/br/bl,相等/统一出单值', () => {
+  const { design } = designFromNodeChanges(cornerNodes, '7-1');
+  const byName = Object.fromEntries((design.children || []).map((c) => [c.name, c]));
+  assert.equal(byName['上圆角卡'].radius, '8/8/0/0');
+  assert.equal(byName['四角同'].radius, 6);
+  assert.equal(byName['统一角'].radius, 12);
+});
+
+test('C:零尺寸容器有可见子 → 保留;零尺寸空叶子 → 丢', () => {
+  const { design } = designFromNodeChanges(cornerNodes, '7-1');
+  const names = (design.children || []).map((c) => c.name);
+  assert.ok(names.includes('零尺寸有子'), '零尺寸但有子的容器应保留');
+  const kept = (design.children || []).find((c) => c.name === '零尺寸有子');
+  assert.equal(kept.children?.[0]?.text, '在零尺寸容器里', '其文本子应在');
+  assert.ok(!names.includes('零尺寸空'), '零尺寸且无子的叶子应被丢');
+});
