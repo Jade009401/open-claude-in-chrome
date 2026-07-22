@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================================
 # open-claude-in-chrome 统一安装器
-#   同时安装:① 侧栏 chat daemon(com.anthropic.claude_sidebar_chat)
+#   同时安装:① 侧栏 chat(direct,com.anthropic.claude_sidebar_chat → chat-native-host.js)
 #            ② 浏览器自动化 host(com.anthropic.open_claude_in_chrome,18 工具)
 #
-# 设计:run-from-clone —— daemon / relay / mcp 全部直接从本 clone 的 host/ 运行,
-#       不再暂存到 Application Support,消除多副本漂移。仓库即运行的代码。
+# 设计:run-from-clone —— host 直接从本 clone 的 host/ 运行(Chrome 原生消息直连,
+#       无 daemon/relay 中转),消除多副本漂移。仓库即运行的代码。
 #
 # 用法:./install.sh <扩展id> [更多扩展id ...]
 #   扩展 id:在 chrome://extensions 开发者模式加载 extension/ 后,复制其 id
@@ -80,24 +80,48 @@ if [[ ! -d "$HOST_DIR/node_modules/@anthropic-ai/claude-agent-sdk" ]]; then
   ( cd "$HOST_DIR" && npm install )
 fi
 
-# ---- 3. 运行期目录 / socket(只放日志和生成物,不放代码) ------------------
+# ---- 3. 运行期目录(只放日志/生成物,不放代码);direct 架构:Chrome 直连 chat-native-host.js ----
 RUNTIME_ROOT="$HOME/Library/Application Support/ClaudeSidebarHost"
-mkdir -p "$RUNTIME_ROOT"
-DAEMON_SOCKET="/tmp/claude-sidebar-daemon-$(id -u).sock"
-RELAY_WRAPPER="$RUNTIME_ROOT/chat-native-relay-wrapper.sh"
+DATA_DIR="$HOME/Library/Application Support/ClaudeSidebarPureMap"
+mkdir -p "$RUNTIME_ROOT" "$DATA_DIR"
+CHAT_WRAPPER="$RUNTIME_ROOT/chat-native-host-wrapper.sh"
 AUTO_WRAPPER="$RUNTIME_ROOT/native-host-wrapper.sh"
-RELAY_LOG="$RUNTIME_ROOT/native-relay.log"
-DAEMON_LOG="$RUNTIME_ROOT/daemon.log"
-CONTEXT_FILE="$RUNTIME_ROOT/browser-context.json"
+CHAT_LOG="$RUNTIME_ROOT/chat-native-host.log"
+MCP_CONFIG="$HOST_DIR/sidebar-mcp.json"
+NODE_DIR="$(dirname "$NODE_BIN")"
 
-# ---- 4. 生成 relay wrapper(Chrome 通过它连 daemon,直接跑 clone 里的 relay) --
-cat > "$RELAY_WRAPPER" <<EOF
-#!/usr/bin/env bash
-# 由 install.sh 生成:Chrome native messaging 入口,转发到常驻 daemon 的 socket。
-export CLAUDE_SIDEBAR_DAEMON_SOCKET="$DAEMON_SOCKET"
-exec "$NODE_BIN" "$HOST_DIR/chat-native-relay.js" 2>>"$RELAY_LOG"
+# ---- 4. 生成 sidebar-mcp.json(chat host 用 --strict-mcp-config 加载浏览器工具 MCP)---
+cat > "$MCP_CONFIG" <<EOF
+{
+  "mcpServers": {
+    "claude-sidebar-pure-map": {
+      "type": "stdio",
+      "command": "$NODE_BIN",
+      "args": ["$HOST_DIR/mcp-server.js"],
+      "env": {
+        "CLAUDE_SIDEBAR_EXPECTED_VERSION": "0.15.3",
+        "CLAUDE_SIDEBAR_EXPECTED_PROTOCOL": "13",
+        "CLAUDE_SIDEBAR_DATA_DIR": "$DATA_DIR"
+      },
+      "timeout": 600000,
+      "alwaysLoad": true
+    }
+  }
+}
 EOF
-chmod +x "$RELAY_WRAPPER"
+
+# 生成 chat direct wrapper(Chrome native messaging 直连 chat-native-host.js,无 daemon/relay)
+cat > "$CHAT_WRAPPER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH="$NODE_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export CLAUDE_SIDEBAR_CLAUDE_BIN="$CLAUDE_BIN"
+export CLAUDE_SIDEBAR_MCP_CONFIG="$MCP_CONFIG"
+export CLAUDE_SIDEBAR_DATA_DIR="$DATA_DIR"
+export CLAUDE_SIDEBAR_DEFAULT_CWD="$REPO_DIR"
+exec "$NODE_BIN" "$HOST_DIR/chat-native-host.js" 2>>"$CHAT_LOG"
+EOF
+chmod +x "$CHAT_WRAPPER"
 
 # ---- 5. 生成浏览器自动化 wrapper(native-host.js,直接跑 clone) ------------
 cat > "$AUTO_WRAPPER" <<EOF
@@ -140,57 +164,20 @@ declare -a NMH_DIRS=(
 )
 echo "注册 native messaging host(扩展 id: ${EXT_IDS[*]})..."
 for d in "${NMH_DIRS[@]}"; do
-  write_manifest "com.anthropic.claude_sidebar_chat" "$RELAY_WRAPPER" "$d"      # 侧栏 daemon
+  write_manifest "com.anthropic.claude_sidebar_chat" "$CHAT_WRAPPER" "$d"       # 侧栏 chat(direct)
   write_manifest "com.anthropic.open_claude_in_chrome" "$AUTO_WRAPPER" "$d"     # 浏览器自动化
+  rm -f "$d/com.sunny.claude_sidebar_chat.json" 2>/dev/null || true             # 清理 sunny 时代残留 manifest
 done
 
-# ---- 7. launchd LaunchAgent:侧栏 daemon 开机自启 + 崩溃自愈 ----------------
-PLIST_LABEL="com.openclaude.sidebar-daemon"
-PLIST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
-mkdir -p "$HOME/Library/LaunchAgents"
-
-# 先卸下旧的 daemon(历史遗留 sunny 版 + 本 label),并停用旧 sunny plist 文件
-for old_label in com.sunny.claude-sidebar-daemon "$PLIST_LABEL"; do
+# ---- 7. 清理已废弃的 daemon LaunchAgent(direct 架构不再需要 daemon/relay)----------------
+# 旧安装可能留有 sunny 版或本项目的 --daemon LaunchAgent + relay,卸载并停用其 plist。
+for old_label in com.sunny.claude-sidebar-daemon com.openclaude.sidebar-daemon; do
   launchctl bootout "gui/$(id -u)/$old_label" 2>/dev/null || true
 done
-OLD_SUNNY="$HOME/Library/LaunchAgents/com.sunny.claude-sidebar-daemon.plist"
-[[ -f "$OLD_SUNNY" ]] && mv "$OLD_SUNNY" "$OLD_SUNNY.disabled"
-
-cat > "$PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$PLIST_LABEL</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$NODE_BIN</string>
-    <string>$HOST_DIR/chat-native-host.js</string>
-    <string>--daemon</string>
-  </array>
-  <key>WorkingDirectory</key><string>$REPO_DIR</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>CLAUDE_SIDEBAR_RUNTIME</key><string>sdk-builtin</string>
-    <key>CLAUDE_SIDEBAR_IMAGE_MODE</key><string>mcp-image</string>
-    <key>CLAUDE_SIDEBAR_DAEMON_SOCKET</key><string>$DAEMON_SOCKET</string>
-    <key>CLAUDE_SIDEBAR_SOURCE_ROOT</key><string>$REPO_DIR</string>
-    <key>CLAUDE_SIDEBAR_CWD</key><string>$REPO_DIR</string>
-    <key>CLAUDE_SIDEBAR_CONTEXT_FILE</key><string>$CONTEXT_FILE</string>
-    <key>CLAUDE_CODE_PATH</key><string>$CLAUDE_BIN</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Background</string>
-  <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>$DAEMON_LOG</string>
-  <key>StandardErrorPath</key><string>$DAEMON_LOG</string>
-</dict>
-</plist>
-EOF
-
-# 加载(优先新式 bootstrap,失败回退 load)
-launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || launchctl load "$PLIST" 2>/dev/null || true
+for old_plist in "$HOME/Library/LaunchAgents/com.sunny.claude-sidebar-daemon.plist" "$HOME/Library/LaunchAgents/com.openclaude.sidebar-daemon.plist"; do
+  [[ -f "$old_plist" ]] && mv "$old_plist" "$old_plist.disabled" 2>/dev/null || true
+done
+rm -f "$RUNTIME_ROOT/chat-native-relay-wrapper.sh" 2>/dev/null || true  # 旧 relay wrapper(relay.js 已删)
 
 # ---- 8. 浏览器自动化 MCP 注册到 Claude Code(幂等) ------------------------
 if [[ -n "$CLAUDE_BIN" ]]; then
@@ -198,20 +185,13 @@ if [[ -n "$CLAUDE_BIN" ]]; then
     || echo "  提示:open-claude-in-chrome MCP 可能已存在;如需重加:claude mcp add open-claude-in-chrome -- node \"$HOST_DIR/mcp-server.js\""
 fi
 
-# ---- 9. 等待 daemon socket 就绪 + 收尾 ------------------------------------
-echo "等待 daemon socket..."
-for _ in {1..50}; do [[ -S "$DAEMON_SOCKET" ]] && break; sleep 0.1; done
-if [[ -S "$DAEMON_SOCKET" ]]; then
-  echo "✔ 侧栏 daemon 已就绪:$DAEMON_SOCKET"
-else
-  echo "⚠ daemon socket 未在预期时间出现,请查看日志:$DAEMON_LOG"
-fi
-
+# ---- 9. 收尾 --------------------------------------------------------------
 cat <<EOF
 
-安装完成。请完全退出 Chrome(⌘Q)后重开。
-  侧栏 daemon:   launchd $PLIST_LABEL(开机自启 / 崩溃自愈)
-  relay 入口:    $RELAY_WRAPPER
+安装完成。请完全退出浏览器(⌘Q)后重开。
+  侧栏 chat(direct):         $CHAT_WRAPPER
+  浏览器自动化 host:          $AUTO_WRAPPER
+  MCP 配置(chat 浏览器工具):  $MCP_CONFIG
   运行代码(真相源,run-from-clone): $HOST_DIR
-  daemon 日志:   $DAEMON_LOG
+  chat host 日志:             $CHAT_LOG
 EOF

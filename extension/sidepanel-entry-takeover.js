@@ -3,9 +3,9 @@
   if (globalThis.__CLAUDE_SIDEBAR_ENTRY_TAKEOVER_V0145__) return;
   globalThis.__CLAUDE_SIDEBAR_ENTRY_TAKEOVER_V0145__ = true;
 
-  const CANONICAL_CHAT_HOST = 'com.sunny.claude_sidebar_chat';
+  const CANONICAL_CHAT_HOST = 'com.anthropic.claude_sidebar_chat';
   const LEGACY_CHAT_HOSTS = new Set([
-    'com.anthropic.claude_sidebar_chat',
+    'com.sunny.claude_sidebar_chat',
   ]);
 
   function canonicalizeHost(name) {
