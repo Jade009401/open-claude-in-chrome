@@ -1946,7 +1946,56 @@ async function actOnAnchorLive(args) {
   return execution?.[0]?.result || { ok: false, code: 'action_no_result' };
 }
 
+// —— /figma-ws:抓当前 Figma tab 的 WS fig-kiwi 帧(全自动) ——
+// 有常驻抓帧脚本且大帧已到 → 直接 grab(不刷新);否则 reload 该 tab 抢初始全量帧 + 轮询等大帧。
+const FIGMA_WS_DATA_THRESHOLD = 50000; // 全量场景图数据帧通常 >>50KB;小于此视作大帧未到
+async function figmaWsStatus(tabId) {
+  try {
+    const [r] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: () => (window.__figCaptureStatus ? window.__figCaptureStatus() : null) });
+    return r?.result || null;
+  } catch { return null; } // 导航中/无 frame 时会抛,轮询重试即可
+}
+async function figmaWsGrab(tabId) {
+  const [r] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: () => (window.__figCaptureGrab ? window.__figCaptureGrab() : null) });
+  return r?.result || null;
+}
+async function captureFigmaWsFrames(args = {}) {
+  const tab = await getTab(args.tabId ? Number(args.tabId) : null);
+  if (!tab?.id) throw new Error('找不到目标标签页');
+  if (!/figma\.com/i.test(String(tab.url || ''))) throw new Error(`当前标签页不是 Figma 页(${tab.url || ''})`);
+  const tabId = tab.id;
+  const requestId = args.__requestId || null;
+  const ready = (s) => Boolean(s && s.schema >= 1 && s.dataMax >= FIGMA_WS_DATA_THRESHOLD);
+
+  let status = await figmaWsStatus(tabId);
+  if (!ready(status)) {
+    // 脚本没常驻(tab 早于扩展加载)或大帧未到 → reload 抢 document_start 初始全量帧,轮询等到。
+    // 大文件加载可能 >60s,每轮发进度重置 idle 护栏(background 90s / mcp-server 60s),避免加长等待被误杀。
+    try { await chrome.tabs.reload(tabId); } catch {}
+    const startedAt = Date.now();
+    const deadline = startedAt + 180000;
+    while (Date.now() < deadline) {
+      await sleep(3000);
+      status = await figmaWsStatus(tabId);
+      sendProgress(requestId, 'figma_ws_waiting', { dataMax: status?.dataMax || 0, elapsedSec: Math.round((Date.now() - startedAt) / 1000) });
+      if (ready(status)) break;
+    }
+    if (!ready(status)) {
+      const mb = ((status?.dataMax || 0) / 1e6).toFixed(1);
+      throw new Error(`Figma 场景图未在 180s 内就绪(当前最大帧 ${mb}MB,文件较大仍在加载)。等页面进度条走完后重发 /figma-ws —— 届时帧已常驻,会立即返回、无需再刷新。`);
+    }
+  }
+  const bundle = await figmaWsGrab(tabId);
+  if (!bundle || !bundle.frames?.length) throw new Error('未抓到 WS 帧(该 Figma 页未产生场景图数据帧;刷新页面后重试)');
+  return { ok: true, bundle, status: status || null, tabUrl: tab.url };
+}
+
 const toolHandlers = {
+  async __pure_map_figma_ws_capture(args) {
+    const result = await captureFigmaWsFrames(args || {});
+    return { content: [{ type: 'text', text: JSON.stringify(result) }] }; // bundle 大,不 pretty-print
+  },
+
   async __pure_map_build_navigation_map(args) {
     const map = await buildUniversalMap({ ...(args || {}), refresh: args?.refresh === true });
     // Always return a compact navigation snapshot. Returning the raw Universal
@@ -2847,7 +2896,7 @@ const toolHandlers = {
 };
 
 const PUBLIC_MAP_TOOLS = new Set(['browser_map', 'browser_locate', 'browser_read', 'browser_act']);
-const INTERNAL_RUNTIME_TOOLS = new Set(['__pure_map_page_context', '__pure_map_build_navigation_map', '__pure_map_read_target', '__pure_map_act_target']);
+const INTERNAL_RUNTIME_TOOLS = new Set(['__pure_map_page_context', '__pure_map_build_navigation_map', '__pure_map_read_target', '__pure_map_act_target', '__pure_map_figma_ws_capture']);
 const INTERNAL_ROUTE_MARKER = 'pure-map-internal-v1';
 
 function isAuthorizedInternalTool(tool, args) {

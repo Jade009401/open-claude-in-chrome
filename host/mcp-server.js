@@ -81,7 +81,7 @@ function timeoutForTool(tool) {
   // Internal build/read routes execute the same long-running work as their
   // public counterparts (virtual-scroll materialization, sequential read
   // plans) and need the same idle budget — 60s killed healthy document reads.
-  if (['browser_map', 'browser_locate', 'browser_read', INTERNAL_NAVIGATION_BUILD_TOOL, INTERNAL_READ_TARGET_TOOL].includes(tool)) return 180000;
+  if (['browser_map', 'browser_locate', 'browser_read', INTERNAL_NAVIGATION_BUILD_TOOL, INTERNAL_READ_TARGET_TOOL, '__pure_map_figma_ws_capture'].includes(tool)) return 180000;
   return 60000;
 }
 function getSidebarConnectionStatus() {

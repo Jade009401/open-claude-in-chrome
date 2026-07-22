@@ -12,6 +12,8 @@ import { PURE_MAP_CLAUDE_TOOL_NAMES, PURE_MAP_SERVER_NAME, validateClaudeToolSur
 import * as qaSidebar from './qa/sidebar-command.mjs';
 // Figma 侧栏命令(/figma):抓当前 Figma tab 选中屏 → 读设计 → 生成前端提示词。逻辑在 host/figma/。
 import * as figmaSidebar from './figma/sidebar-command.mjs';
+// Figma-WS 侧栏命令(/figma-ws):独立于 REST,全自动拦 WS fig-kiwi 帧 → 解码抽子树 → 加载进会话。逻辑在 host/figma-ws/。
+import * as figmaWsSidebar from './figma-ws/sidebar-command.mjs';
 
 const VERSION = '0.15.3';
 const HOST_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -849,6 +851,10 @@ export async function handleIncomingMessage(rawMessage) {
         figmaSidebar.answer(chatText);
         return { type: 'accepted', requestId: String(message.requestId || `figma-${Date.now()}`) };
       }
+      if (figmaWsSidebar.hasPending()) { // /figma-ws 等"前端仓库路径"回复
+        figmaWsSidebar.answer(chatText);
+        return { type: 'accepted', requestId: String(message.requestId || `figma-ws-${Date.now()}`) };
+      }
       // 当前页 pageContext(/qa 与 /figma 共用):chat 消息带 pageContext;回退到 host 侧上下文权威。
       const snap = contextAuthority.snapshot();
       const pc = (message.pageContext && Number(message.pageContext.tabId) ? message.pageContext : null)
@@ -875,6 +881,23 @@ export async function handleIncomingMessage(rawMessage) {
         };
         // 加载模式:读设计 → 注入当前会话(用侧栏 cwd;非前端仓库会先问用户)。之后续聊即在该仓库开发。
         figmaSidebar.runFigmaInSidebar(chatText, emit, pageContext, {
+          cwd: String(message.cwd || ''),
+          inject: (repo, prompt) => {
+            try { enqueueChat({ type: 'chat', prompt, cwd: repo, sessionId: message.sessionId }); }
+            catch (e) { emitAssistantMessage(requestId, `注入开发会话失败:${e?.message || e}`); }
+          },
+        });
+        return { type: 'accepted', requestId };
+      }
+      if (figmaWsSidebar.isFigmaWsCommand(chatText)) {
+        const requestId = String(message.requestId || `figma-ws-${Date.now()}`);
+        const emit = {
+          status: (label) => emitStatus(requestId, label),
+          message: (text) => emitAssistantMessage(requestId, text),
+          done: () => emitDone({ requestId }),
+        };
+        // 独立 WS 管道:全自动抓帧 → 解码抽子树 → 注入会话(cwd 用侧栏;非前端仓库先问)。
+        figmaWsSidebar.runFigmaWsInSidebar(chatText, emit, pageContext, {
           cwd: String(message.cwd || ''),
           inject: (repo, prompt) => {
             try { enqueueChat({ type: 'chat', prompt, cwd: repo, sessionId: message.sessionId }); }

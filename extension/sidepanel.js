@@ -1264,6 +1264,7 @@ function commandQuery() {
 const BUILTIN_COMMANDS = [
   { name: "qa", argumentHint: "<PRD链接> [被测页URL]", description: "飞书 PRD 自动化测试:读需求→生成脚本→人审→重放→结果播报" },
   { name: "figma", description: "读当前 Figma 选中屏 → 生成前端开发提示词(用项目组件)" },
+  { name: "figma-ws", argumentHint: "[页面名]", description: "拦 WS 直读当前 Figma 选中屏(免 token/免限流) → 加载进会话开发" },
   { name: "cost", description: "显示本次会话的 token 用量与花费" },
   { name: "context", description: "查看当前上下文占用明细" },
   { name: "status", description: "查看 Claude Code 运行状态" },

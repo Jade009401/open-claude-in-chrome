@@ -60,7 +60,9 @@ function buildDevPrompt({ design, componentList = [], palette = [], pageName, st
     paletteSection,
     '',
     '## 设计还原(来自 Figma,单位 px;〔组件〕=用项目对应组件替换;×N=同款重复只列示样)',
+    '```', // 代码块围栏:侧栏等宽渲染,树状缩进不被 markdown 压塌
     specLines.join('\n'),
+    '```',
     '',
     '## 要求',
     '- 严格按尺寸 / 间距 / 颜色还原;auto-layout 的 gap/padding 用 flex 实现。',
@@ -84,7 +86,9 @@ function buildLoadContext({ design, componentList = [], palette = [], pageName }
     figmaComps + paletteLine,
     '',
     '## 设计还原(px;〔组件〕=用当前仓库对应组件;×N=同款只列示样)',
+    '```', // 代码块围栏:等宽渲染,树状缩进不塌
     specLines.join('\n'),
+    '```',
   ].join('\n');
 }
 
