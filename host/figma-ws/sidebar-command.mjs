@@ -82,7 +82,8 @@ async function runFigmaWsInSidebar(text, emit, pageContext = null, { cwd = '', i
     const name = pageName || design?.name || '页面';
     emit.status('Figma-WS:生成开发提示词…');
     const devPrompt = buildDevPrompt({ design, componentList, palette, pageName });
-    emit.message(`【Figma 设计「${name}」→ 前端开发提示词(${nodeCount} 节点)】\n\n${devPrompt}`);
+    // 整段提示词包进一个代码块(从"你是资深前端工程师"起全程等宽,统一不散);标题行在块外当抬头。
+    emit.message(`【Figma 设计「${name}」→ 前端开发提示词(${nodeCount} 节点)】\n\n\`\`\`\n${devPrompt}\n\`\`\``);
     if (inject) {
       // 注入为会话背景:Claude 记住这份设计以回答追问,但不主动写代码(提示词已发给用户)。不绑定项目,cwd 用侧栏当前值。
       const primer = `${buildLoadContext({ design, componentList, palette, pageName })}\n\n(上面的前端开发提示词已发给用户。现在只回复一句"设计已就绪,可以追问",等用户提问或明确说开发再动手。)`;
