@@ -440,6 +440,34 @@ function extractText(event) {
 // "浏览器地图工具已加载" 每会话只报一次:每轮 Claude Code init 都触发校验,若每轮都 emit
 // 会让人误以为每轮在加载地图(实际只是工具面校验、地图是服务端缓存复用)。
 const mapToolStatusShownSessions = new Set();
+
+// —— 子 agent(Task/Agent 工具)→ 侧栏可切换的独立线程窗 ——
+// SDK 限制:子 agent 内部步骤不进主流,只有"启动(Agent tool_use)"+"最终结果(tool_result)"。
+// 所以窗内容 = 任务(prompt)+ 最终结果,不含实时中间步骤。事件类型与 sidepanel 消费端对齐。
+function textFromContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.filter((p) => p?.type === 'text' && typeof p.text === 'string').map((p) => p.text).join('\n').trim();
+  return '';
+}
+function emitSubagentInvoked(state, tu) {
+  if (!tu?.id) return;
+  state.subagents = state.subagents || new Map();
+  if (state.subagents.has(tu.id)) return; // 去重(同一 tool_use 可能多次出现)
+  const agentName = tu.input?.subagent_type || 'subagent';
+  const task = String(tu.input?.description || tu.input?.prompt || '').trim();
+  state.subagents.set(tu.id, { agentName });
+  writeNative({ type: 'agent_invoked', requestId: state.requestId, threadId: tu.id, toolUseId: tu.id, agentName, description: task.slice(0, 200) });
+  if (task) writeNative({ type: 'agent_message', requestId: state.requestId, threadId: tu.id, agentName, role: 'user', text: task });
+}
+function emitSubagentResult(state, tr) {
+  const id = tr?.tool_use_id;
+  const sub = id && state.subagents?.get(id);
+  if (!sub) return;
+  const text = textFromContent(tr.content) || (tr.is_error ? '(子 agent 报错,无文本)' : '(子 agent 无文本结果)');
+  writeNative({ type: 'agent_message', requestId: state.requestId, threadId: id, agentName: sub.agentName, role: 'assistant', text });
+  writeNative({ type: 'agent_turn_end', requestId: state.requestId, threadId: id, agentName: sub.agentName, status: tr.is_error ? 'failed' : 'completed' });
+  state.subagents.delete(id);
+}
 function parseStreamLine(state, line) {
   let event;
   try { event = JSON.parse(line); } catch { return; }
@@ -503,6 +531,15 @@ function parseStreamLine(state, line) {
     return;
   }
   if (type === 'assistant') {
+    // 子 agent 自己的完整消息带 parent_tool_use_id:路由到该子 agent 窗,绝不泄漏进主对话。
+    const parentId = event.parent_tool_use_id ?? event.message?.parent_tool_use_id ?? null;
+    if (parentId) {
+      if (state.subagents?.has(parentId)) {
+        const subText = extractText(event);
+        if (subText) writeNative({ type: 'agent_message', requestId: state.requestId, threadId: parentId, agentName: state.subagents.get(parentId).agentName, role: 'assistant', text: subText });
+      }
+      return; // 不进主对话流
+    }
     const text = extractText(event);
     if (text && text === state.partialText) {
       // Already streamed token by token; record it and emit nothing.
@@ -514,8 +551,18 @@ function parseStreamLine(state, line) {
       state.partialText = '';
       if (delta) emitAssistantDelta(state.requestId, delta);
     }
-    const toolUse = Array.isArray(event.message?.content) ? event.message.content.find((part) => part?.type === 'tool_use') : null;
-    if (toolUse?.name) emitStatus(state.requestId, `正在执行 ${toolUse.name}`, 'running');
+    const parts = Array.isArray(event.message?.content) ? event.message.content : [];
+    for (const tu of parts) { // 遍历所有 tool_use:Agent/Task → 建可切换的子 agent 窗(支持并行多个)
+      if (tu?.type === 'tool_use' && (tu.name === 'Agent' || tu.name === 'Task')) emitSubagentInvoked(state, tu);
+    }
+    const otherTool = parts.find((p) => p?.type === 'tool_use' && p.name && p.name !== 'Agent' && p.name !== 'Task');
+    if (otherTool) emitStatus(state.requestId, `正在执行 ${otherTool.name}`, 'running');
+    return;
+  }
+  if (type === 'user') {
+    // 工具结果回来:命中已记录的子 agent → 写入其窗(最终结果)+ 标记完成。
+    const parts = Array.isArray(event.message?.content) ? event.message.content : [];
+    for (const p of parts) if (p?.type === 'tool_result') emitSubagentResult(state, p);
     return;
   }
   if (type === 'result') {
