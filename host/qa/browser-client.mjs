@@ -61,6 +61,7 @@ class BrowserClient {
             const entry = this.pending.get(String(msg.id));
             if (!entry) continue;
             this.pending.delete(String(msg.id));
+            if (msg.type === 'status') { entry.resolve(msg); continue; } // 就绪查询回复:整条返回(含 ready 等)
             if (msg.type === 'tool_error') entry.reject(new Error(msg.error || 'tool_error'));
             else entry.resolve(unwrap(msg.result));
           }
@@ -75,12 +76,40 @@ class BrowserClient {
     });
   }
 
-  callTool(tool, args = {}) {
+  callTool(tool, args = {}, { timeoutMs = 240000 } = {}) {
     const id = String(this.nextId++);
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) reject(new Error(`callTool 超时(${Math.round(timeoutMs / 1000)}s):${tool}`));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
       this.socket.write(`${JSON.stringify({ id, type: 'tool_request', tool, args })}\n`);
     });
+  }
+
+  // 查一次 transport 就绪状态(不触发扩展,primary 直接回)。
+  status({ timeoutMs = 5000 } = {}) {
+    const id = String(this.nextId++);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { if (this.pending.delete(id)) reject(new Error('status 超时')); }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
+      this.socket.write(`${JSON.stringify({ id, type: 'status' })}\n`);
+    });
+  }
+
+  // 轮询等浏览器传输就绪(native-host 桥接上 primary + 收到 extension_hello);超时抛 browser_transport_unavailable。
+  async waitReady({ timeoutMs = 45000, intervalMs = 1000 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    while (Date.now() < deadline) {
+      try { last = await this.status(); if (last?.ready) return true; } catch {}
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    const e = new Error(`浏览器传输未就绪(等 ${Math.round(timeoutMs / 1000)}s):native-host/扩展未连上${last ? `(state=${last.recoveryState} nativeHost=${last.nativeHostConnected} extHello=${last.extensionReady})` : ''}`);
+    e.code = 'browser_transport_unavailable';
+    throw e;
   }
 
   map(args) { return this.callTool('browser_map', args); }

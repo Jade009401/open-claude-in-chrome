@@ -69,6 +69,9 @@ async function runFigmaWsInSidebar(text, emit, pageContext = null, { cwd = '', i
     await ensurePrimary();
     browser = new BrowserClient();
     await browser.connect();
+    // 关键:发 capture 前先等浏览器传输就绪(native-host 桥接上 primary),否则请求会掉进无就绪队列永久卡住。
+    emit.status('Figma-WS:等待浏览器通道就绪…');
+    await browser.waitReady({ timeoutMs: 45000 });
     emit.status('Figma-WS:抓取设计数据帧(首次会自动刷新该页;大文件首次可能 1–3 分钟,之后秒出)…');
     const res = await browser.callTool(CAPTURE_TOOL, { tabId: tabId || undefined, ...INTERNAL_MARKERS });
     const bundle = res?.bundle;
@@ -90,7 +93,10 @@ async function runFigmaWsInSidebar(text, emit, pageContext = null, { cwd = '', i
       inject(cwd, primer);
     }
   } catch (e) {
-    emit.message(`Figma-WS 读取/加载失败:${String(e?.message || e)}`);
+    const msg = e?.code === 'browser_transport_unavailable'
+      ? `Figma-WS 失败:浏览器通道没连上(${String(e?.message || e)})。请确认已 reload 扩展 + ⌘Q 重开浏览器,让 native-host 桥连上;稍等几秒重发。`
+      : String(e?.message || e);
+    emit.message(`Figma-WS 读取/加载失败:${msg}`);
   } finally {
     try { browser?.close(); } catch {}
     emit.done();

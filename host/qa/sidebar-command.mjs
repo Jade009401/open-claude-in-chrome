@@ -116,6 +116,7 @@ async function runQaInSidebar(text, emit, pageContext = null) {
       primaryChild = await ensurePrimary();
       const browser = new BrowserClient();
       await browser.connect();
+      await browser.waitReady({ timeoutMs: 45000 }); // 等浏览器传输就绪再用工具,避免请求掉进无就绪队列卡死
       return browser;
     };
     deps = buildRealDeps({

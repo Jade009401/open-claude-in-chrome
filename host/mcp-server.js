@@ -70,6 +70,8 @@ const pendingRequests = pendingTracker.requests;
 const clientSockets = new Map();
 const clientRequestMap = new Map();
 const forwardedQueue = new Map();
+const forwardedTimers = new Map(); // client 转发请求的超时定时器(prefixedId→timer):防传输不就绪时永久排队
+const FORWARD_READY_TIMEOUT_MS = 45000; // 排队等 transport 就绪的上限,超时回 tool_error
 
 function writeLine(socket, value) {
   if (!socket || socket.destroyed || !socket.writable) return false;
@@ -199,7 +201,10 @@ function dispatchQueuedAfterExtensionReady() {
     }
   }
   for (const [id, queued] of forwardedQueue) {
-    if (writeLine(nativeHostSocket, queued.message)) forwardedQueue.delete(id);
+    if (writeLine(nativeHostSocket, queued.message)) {
+      forwardedQueue.delete(id);
+      const t = forwardedTimers.get(id); if (t) { clearTimeout(t); forwardedTimers.delete(id); }
+    }
   }
 }
 function handleNativeMessage(msg) {
@@ -290,16 +295,33 @@ function attachClient(socket, initial = Buffer.alloc(0), hello = {}) {
   writeLine(socket, { type: 'client_ack', clientId, version: VERSION, protocolVersion: PROTOCOL_VERSION, compatible });
   const state = { buffer: Buffer.alloc(0) };
   const onMessage = (msg) => {
-    if (!msg.id || (msg.type !== 'tool_request' && msg.type !== 'tool_cancel')) return;
+    if (!msg.id) return;
+    // 就绪查询:不触发扩展,直接回当前 transport 状态,供 BrowserClient 轮询等桥通(waitReady)。
+    if (msg.type === 'status') {
+      writeLine(socket, { type: 'status', id: msg.id, ready: transportReady(), recoveryState, nativeHostConnected: Boolean(nativeHostSocket && !nativeHostSocket.destroyed), extensionReady: Boolean(extensionReadyAt) });
+      return;
+    }
+    if (msg.type !== 'tool_request' && msg.type !== 'tool_cancel') return;
     const prefixedId = `c${clientId}_${msg.id}`;
+    const clearForwardTimer = () => { const t = forwardedTimers.get(prefixedId); if (t) { clearTimeout(t); forwardedTimers.delete(prefixedId); } };
     if (msg.type === 'tool_cancel') {
-      forwardedQueue.delete(prefixedId);
+      forwardedQueue.delete(prefixedId); clearForwardTimer();
       writeLine(nativeHostSocket, { ...msg, id: prefixedId });
       return;
     }
     clientRequestMap.set(prefixedId, { clientId, originalId: msg.id });
     const message = { ...msg, id: prefixedId };
-    if (!transportReady() || !writeLine(nativeHostSocket, message)) forwardedQueue.set(prefixedId, { message, createdAt: Date.now() });
+    if (!transportReady() || !writeLine(nativeHostSocket, message)) {
+      forwardedQueue.set(prefixedId, { message, createdAt: Date.now() });
+      // client 转发无超时会永久挂:排队超 45s 仍未就绪 → 回 tool_error(而非死等)。
+      const timer = setTimeout(() => {
+        if (!forwardedQueue.has(prefixedId)) return;
+        forwardedQueue.delete(prefixedId); forwardedTimers.delete(prefixedId); clientRequestMap.delete(prefixedId);
+        writeLine(socket, { id: msg.id, type: 'tool_error', error: `browser_transport_unavailable: 浏览器传输 ${Math.round(FORWARD_READY_TIMEOUT_MS / 1000)}s 内未就绪(native-host/扩展未连上,state=${recoveryState})` });
+      }, FORWARD_READY_TIMEOUT_MS);
+      timer.unref?.();
+      forwardedTimers.set(prefixedId, timer);
+    }
   };
   if (initial.length) processLines(state, initial, onMessage);
   socket.on('data', (chunk) => processLines(state, chunk, onMessage));
@@ -307,7 +329,7 @@ function attachClient(socket, initial = Buffer.alloc(0), hello = {}) {
   socket.on('close', () => {
     clientSockets.delete(clientId);
     for (const [id, route] of clientRequestMap) if (route.clientId === clientId) clientRequestMap.delete(id);
-    for (const [id] of forwardedQueue) if (id.startsWith(`c${clientId}_`)) forwardedQueue.delete(id);
+    for (const [id] of forwardedQueue) if (id.startsWith(`c${clientId}_`)) { forwardedQueue.delete(id); const t = forwardedTimers.get(id); if (t) { clearTimeout(t); forwardedTimers.delete(id); } }
   });
 }
 function createPrimaryServer() {
