@@ -64,10 +64,13 @@ async function runFigmaWsInSidebar(text, emit, pageContext = null, { cwd = '', i
   }
   const { pageName } = parseFigmaWsCommand(text);
   let browser = null;
+  let primaryChild = null;
   try {
-    // 1) 全自动抓帧(可能自动刷新该 Figma 页以抢初始全量帧)
+    // 1) 抓帧
     emit.status('Figma-WS:连接浏览器通道…');
-    await ensurePrimary();
+    // 存住 primaryChild:mcp-server 是 MCP stdio server,stdin EOF 即自杀;spawn 的 child.stdin(pipe 写端)
+    // 一旦没人持就会被 GC 关掉 → primary 半路死。必须持有到 finally(与 /qa 一致),否则抓帧中途桥塌。
+    primaryChild = await ensurePrimary();
     browser = new BrowserClient();
     await browser.connect();
     // 关键:发 capture 前先等浏览器传输就绪(native-host 桥接上 primary),否则请求会掉进无就绪队列永久卡住。
@@ -113,6 +116,7 @@ async function runFigmaWsInSidebar(text, emit, pageContext = null, { cwd = '', i
     emit.message(`Figma-WS 读取/加载失败:${msg}`);
   } finally {
     try { browser?.close(); } catch {}
+    try { primaryChild?.kill(); } catch {} // 跑完回收本命令自持的 primary(与 /qa 一致)
     emit.done();
   }
 }
