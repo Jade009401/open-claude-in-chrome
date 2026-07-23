@@ -1,12 +1,13 @@
 // 侧栏 /figma-ws 命令(独立于 REST 的 /figma):全自动抓当前 Figma tab 的 WS fig-kiwi 帧 →
 // host 解码 → 按 URL node-id 抽子树 → 去噪 → 把设计"加载"进当前开发会话(不自动开发)。
 // 抓帧复用现成浏览器工具桥(mcp-server ↔ background):BrowserClient 调内部工具 __pure_map_figma_ws_capture。
+import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { BrowserClient } from '../qa/browser-client.mjs';
-import { readWsDesignFromBundle } from './ws-design.mjs';
+import { readWsDesignFromBinary } from './ws-design.mjs';
 import { buildDevPrompt, buildLoadContext } from '../figma/prompt-gen.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -72,14 +73,27 @@ async function runFigmaWsInSidebar(text, emit, pageContext = null, { cwd = '', i
     // 关键:发 capture 前先等浏览器传输就绪(native-host 桥接上 primary),否则请求会掉进无就绪队列永久卡住。
     emit.status('Figma-WS:等待浏览器通道就绪…');
     await browser.waitReady({ timeoutMs: 45000 });
-    emit.status('Figma-WS:抓取设计数据帧(首次会自动刷新该页;大文件首次可能 1–3 分钟,之后秒出)…');
-    const res = await browser.callTool(CAPTURE_TOOL, { tabId: tabId || undefined, ...INTERNAL_MARKERS });
-    const bundle = res?.bundle;
-    if (!bundle?.frames?.length) throw new Error(res?.error || '未抓到 WS 帧');
+    emit.status('Figma-WS:抓取设计数据帧…');
+    // 超时给 300s(充裕):不自动 reload,故无 180s 等待;落盘只需 status 查一次 + 下载轮询 ≤60s。
+    const res = await browser.callTool(CAPTURE_TOOL, { tabId: tabId || undefined, ...INTERNAL_MARKERS }, { timeoutMs: 300000 });
+    // 页面未就绪 / 常驻脚本是旧版 → 提示用户手动刷新后重发(不自动刷新,见项目记忆)。友好提示,非报错。
+    if (res?.needsRefresh) {
+      const why = res.reason === 'stale_script' ? '抓帧脚本刚更新(该页还挂着旧版脚本)'
+        : res.reason === 'no_script' ? '这个标签页在扩展加载前就打开了(没装上抓帧脚本)'
+        : `场景图还没加载完(当前最大帧 ${res.dataMaxMb || 0}MB)`;
+      emit.message(`需要先刷新页面:${why}。\n请在该 Figma 标签页按 ⌘R 刷新,等页面加载完(进度条走完)后,重新发 /figma-ws。`);
+      return; // finally 会 closeBrowser + done
+    }
+    const framePath = res?.framePath;
+    if (!framePath) throw new Error(res?.error || '未抓到 WS 帧');
 
-    // 2) 解码 + 按 node-id 抽子树 + 去噪
+    // 2) 读盘(帧已原生落盘,不经通道搬 53MB)→ 解码 + 按 node-id 抽子树 + 去噪。读完即删临时文件。
     emit.status(`Figma-WS:解码 + 抽取 node ${nodeId} 子树…`);
-    const { design, palette, componentList, nodeCount } = readWsDesignFromBundle(bundle, nodeId);
+    let buf;
+    try { buf = fs.readFileSync(framePath); }
+    catch (readErr) { throw new Error(`读取帧文件失败(${framePath}):${readErr?.message || readErr}`); }
+    finally { try { fs.unlinkSync(framePath); } catch {} }
+    const { design, palette, componentList, nodeCount } = readWsDesignFromBinary(buf, nodeId);
 
     // 3) 生成开发提示词,直接发给用户;同时把设计注入会话上下文(供后续追问 Claude 记得这份设计)。
     const name = pageName || design?.name || '页面';

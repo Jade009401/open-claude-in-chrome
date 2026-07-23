@@ -1959,6 +1959,38 @@ async function figmaWsGrab(tabId) {
   const [r] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: () => (window.__figCaptureGrab ? window.__figCaptureGrab() : null) });
   return r?.result || null;
 }
+// 落盘抓帧:页面把帧原生写盘(二进制),扩展经 chrome.downloads 拿绝对路径交 host 读。
+// 避免 39MB 帧经 executeScript 返回 → 原生消息 → TCP 多趟序列化卡死(曾 240s 超时)。
+async function figmaWsGrabToDisk(tabId, requestId) {
+  const token = `${Date.now()}-${tabId}`; // 唯一,供 downloads.search 精确匹配本次文件
+  const basename = `figma-ws-frames-${token}.bin`;
+  const [r] = await chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN',
+    func: (bn) => (window.__figCaptureGrabToDisk ? window.__figCaptureGrabToDisk(bn) : null),
+    args: [basename],
+  });
+  const meta = r?.result || null;
+  // meta 为 null = 页面里没有 __figCaptureGrabToDisk(常驻脚本是旧版:扩展刚更新、该 tab 未换新内容脚本)。
+  // 交调用方 reload 换新脚本重试,别当"没帧"误报。meta 存在但 ok=false 才是真的抓帧失败。
+  if (!meta) return { stale: true };
+  if (!meta.ok) throw new Error('落盘抓帧失败(页面未产生场景图数据帧;刷新后重试)');
+  // 轮询下载记录拿绝对路径(不假设 Downloads 目录 —— 用户可能改过下载位置)。
+  const deadline = Date.now() + 60000;
+  let item = null;
+  while (Date.now() < deadline) {
+    await sleep(400);
+    sendProgress(requestId, 'figma_ws_downloading', { bytes: meta.bytes || 0 });
+    let found = [];
+    try { found = await chrome.downloads.search({ query: [token] }); } catch {}
+    const bad = found.find((d) => d.state === 'interrupted');
+    if (bad) throw new Error(`帧文件下载中断(${bad.error || 'interrupted'})`);
+    const done = found.find((d) => d.state === 'complete' && d.filename);
+    if (done) { item = done; break; }
+  }
+  if (!item) throw new Error('帧文件落盘超时(60s);若浏览器开了"每次下载前询问保存位置"请关闭后重试');
+  try { await chrome.downloads.erase({ id: item.id }); } catch {} // 清下载记录/角标,文件留给 host 读完再删
+  return { framePath: item.filename, meta };
+}
 async function captureFigmaWsFrames(args = {}) {
   const tab = await getTab(args.tabId ? Number(args.tabId) : null);
   if (!tab?.id) throw new Error('找不到目标标签页');
@@ -1967,27 +1999,18 @@ async function captureFigmaWsFrames(args = {}) {
   const requestId = args.__requestId || null;
   const ready = (s) => Boolean(s && s.schema >= 1 && s.dataMax >= FIGMA_WS_DATA_THRESHOLD);
 
-  let status = await figmaWsStatus(tabId);
+  // 不自动刷新页面(会打断用户 + 抓帧中途 reload 可能扰动浏览器桥)。只查一次:
+  // 未就绪(无常驻脚本 / 大帧未到)→ 提示用户手动刷新;就绪则落盘抓帧。
+  const status = await figmaWsStatus(tabId);
   if (!ready(status)) {
-    // 脚本没常驻(tab 早于扩展加载)或大帧未到 → reload 抢 document_start 初始全量帧,轮询等到。
-    // 大文件加载可能 >60s,每轮发进度重置 idle 护栏(background 90s / mcp-server 60s),避免加长等待被误杀。
-    try { await chrome.tabs.reload(tabId); } catch {}
-    const startedAt = Date.now();
-    const deadline = startedAt + 180000;
-    while (Date.now() < deadline) {
-      await sleep(3000);
-      status = await figmaWsStatus(tabId);
-      sendProgress(requestId, 'figma_ws_waiting', { dataMax: status?.dataMax || 0, elapsedSec: Math.round((Date.now() - startedAt) / 1000) });
-      if (ready(status)) break;
-    }
-    if (!ready(status)) {
-      const mb = ((status?.dataMax || 0) / 1e6).toFixed(1);
-      throw new Error(`Figma 场景图未在 180s 内就绪(当前最大帧 ${mb}MB,文件较大仍在加载)。等页面进度条走完后重发 /figma-ws —— 届时帧已常驻,会立即返回、无需再刷新。`);
-    }
+    return { ok: false, needsRefresh: true, reason: status ? 'frames_not_ready' : 'no_script', dataMaxMb: ((status?.dataMax || 0) / 1e6).toFixed(1) };
   }
-  const bundle = await figmaWsGrab(tabId);
-  if (!bundle || !bundle.frames?.length) throw new Error('未抓到 WS 帧(该 Figma 页未产生场景图数据帧;刷新页面后重试)');
-  return { ok: true, bundle, status: status || null, tabUrl: tab.url };
+  // 帧原生写盘,只把绝对路径(几十字节)带回 host —— 大帧不再经 executeScript/原生消息搬运。
+  const grab = await figmaWsGrabToDisk(tabId, requestId);
+  // 常驻脚本是旧版(扩展刚更新、该 tab 还挂旧内容脚本,无 __figCaptureGrabToDisk)→ 同样提示手动刷新换新脚本。
+  if (grab?.stale) return { ok: false, needsRefresh: true, reason: 'stale_script', dataMaxMb: ((status?.dataMax || 0) / 1e6).toFixed(1) };
+  if (!grab?.framePath) throw new Error('未抓到 WS 帧(该 Figma 页未产生场景图数据帧;刷新页面后重试)');
+  return { ok: true, framePath: grab.framePath, meta: grab.meta, status, tabUrl: tab.url };
 }
 
 const toolHandlers = {

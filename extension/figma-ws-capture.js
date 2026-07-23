@@ -56,10 +56,13 @@
 
   // 保留全部 schema 帧 + 最大的若干 data 帧(丢掉小的增量/keepalive),避免 JSON 过大。
   // 生产按需 grab 只取 schema + 最大 2 个数据帧(全量帧最大);下载调试用更宽。
-  function bundle(dataLimit = 6) {
+  function keptFrames(dataLimit = 2) {
     const schema = frames.filter((f) => f.isSchema);
     const data = frames.filter((f) => !f.isSchema).sort((a, b) => b.bytes.length - a.bytes.length);
-    const keep = [...schema, ...data.slice(0, dataLimit)];
+    return { schema, keep: [...schema, ...data.slice(0, dataLimit)] };
+  }
+  function bundle(dataLimit = 6) {
+    const { schema, keep } = keptFrames(dataLimit);
     return {
       url: location.href,
       total: frames.length,
@@ -87,10 +90,36 @@
     return payload;
   }
 
-  // 生产:扩展经 executeScript(MAIN) 调 __figCaptureGrab() 取帧(schema + 最大数据帧);
+  // 生产落盘抓帧:把帧打包成二进制(不 base64,避免 39MB→53MB 膨胀 + 多趟 JSON 序列化)→ 原生下载,
+  // 扩展侧经 chrome.downloads 拿绝对路径交给 host 读盘。容器格式:
+  //   [4字节 uint32 LE = 头 JSON 字节长][头 JSON: {url,total,frames:[{len,isSchema}]}][按序拼接的原始帧字节]
+  function grabToDisk(basename) {
+    const { schema, keep } = keptFrames(2);
+    const header = JSON.stringify({
+      url: location.href,
+      total: frames.length,
+      frames: keep.map((f) => ({ len: f.bytes.length, isSchema: f.isSchema })),
+    });
+    const headerBytes = new TextEncoder().encode(header);
+    const lenBuf = new Uint8Array(4);
+    new DataView(lenBuf.buffer).setUint32(0, headerBytes.length, true);
+    const blob = new Blob([lenBuf, headerBytes, ...keep.map((f) => f.bytes)], { type: 'application/octet-stream' });
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = basename || 'figma-ws-frames.bin';
+    (document.body || document.documentElement).appendChild(a);
+    a.click();
+    setTimeout(() => { try { a.remove(); URL.revokeObjectURL(href); } catch {} }, 8000);
+    console.log(`${TAG} 落盘 ${a.download}:${keep.length} 帧(schema ${schema.length},总收到 ${frames.length}),${blob.size} 字节`);
+    return { ok: true, basename: a.download, kept: keep.length, schemaFrames: schema.length, total: frames.length, bytes: blob.size };
+  }
+
+  // 生产:扩展经 executeScript(MAIN) 调 __figCaptureGrabToDisk(basename) 落盘取帧(schema + 最大数据帧);
   // __figCaptureStatus() 供扩展判断"大帧到了没"(dataMax=最大非 schema 帧字节)。
-  // __figCaptureDownload() 仅手动调试兜底。不再自动下载(避免污染下载夹)。
+  // __figCaptureGrab()/__figCaptureDownload() 保留作手动调试兜底(base64 JSON)。
   window.__figCaptureGrab = () => bundle(2);
+  window.__figCaptureGrabToDisk = grabToDisk;
   window.__figCaptureDownload = download;
   window.__figCaptureStatus = () => {
     const data = frames.filter((f) => !f.isSchema);
